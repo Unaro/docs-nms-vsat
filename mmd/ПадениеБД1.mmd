@@ -39,21 +39,21 @@ sequenceDiagram
     PCM2->>DB2: pgsql promote (ocf:heartbeat:pgsqlms)
     DB2->>DB2: pg_ctl promote (переход в статус Master RW)
 
-    Note over PCM2: Colocation constraints:<br/>vip with master pgsql-clone (500)<br/>app-stack with vip (INFINITY)<br/>Order: start vip then start app-stack
+    Note over PCM2: Colocation constraints:<br/>vip with master pgsql-clone (500)<br/>core-app-stack with vip (INFINITY)<br/>Order: start vip then start core-app-stack then daemon-svc
     PCM1->>VIP1: Снятие VIP (192.168.1.100)
-    PCM1->>App1: Остановка app-stack (app-svc, daemon-svc, haproxy)
+    PCM1->>App1: Остановка core-app-stack (haproxy-svc, app-svc) и daemon-svc
     
     PCM2->>VIP2: Подъем VIP (192.168.1.100 на eth0)
     VIP2->>Eltex: Рассылка Gratuitous ARP (GARP)
     Eltex->>Eltex: Обновление ARP-таблицы (VIP на MAC node2)
 
-    PCM2->>HAP2: Запуск haproxy-svc
-    PCM2->>App2: Запуск app-svc (my-app) и daemon-svc (my-daemon)
-
+    PCM2->>HAP2: Запуск haproxy-svc [группа core-app-stack]
+    PCM2->>App2: Запуск app-svc (my-app) и зависимого daemon-svc
+ 
     loop Healthcheck HAProxy2 (:9200)
         HAP2->>SOK2: GET / на 127.0.0.1:9200
-        SOK2->>DB2: psql SELECT pg_is_in_recovery()
-        DB2-->>SOK2: Ответ f (Master)
+        SOK2->>DB2: psql timeout 1.5s: SELECT pg_is_in_recovery(), transaction_read_only
+        DB2-->>SOK2: Ответ 'f, off' (Master, RW активен)
         SOK2-->>HAP2: HTTP/1.1 200 OK Master (node2_db UP)
         HAP2->>SOK1: GET / на 10.0.0.1:9200 (Connection refused DOWN)
     end

@@ -21,18 +21,18 @@ sequenceDiagram
     end
 
     Note over PCM1, PCM2: Corosync knet: Ring 0 (10.0.0.x, prio 100) + Ring 1 (192.168.1.x, prio 50)<br/>Quorum 2/2 OK, no-quorum-policy=stop
-    PCM1->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=100)
-    PCM2->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=100)
+    PCM1->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=1000)
+    PCM2->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=1000)
 
     loop Healthcheck каждые 2 сек (inter 2s)
         HAP1->>SOK1: GET / на 127.0.0.1:9200 (systemd socket)
-        SOK1->>DB1: psql SELECT pg_is_in_recovery()
-        DB1-->>SOK1: f (Не в recovery = Master)
+        SOK1->>DB1: psql timeout 1.5s: SELECT pg_is_in_recovery(), transaction_read_only
+        DB1-->>SOK1: 'f, off' (Master, RW активен)
         SOK1-->>HAP1: HTTP/1.1 200 OK Master (node1_db UP)
 
         HAP1->>SOK2: GET / на 10.0.0.2:9200 (Ring 0)
-        SOK2->>DB2: psql SELECT pg_is_in_recovery()
-        DB2-->>SOK2: t (В recovery = Standby)
+        SOK2->>DB2: psql timeout 1.5s: SELECT pg_is_in_recovery(), transaction_read_only
+        DB2-->>SOK2: 't, off' (В recovery = Standby)
         SOK2-->>HAP1: HTTP/1.1 503 Service Unavailable Slave
     end
 

@@ -29,7 +29,7 @@ sequenceDiagram
         PCM2->>PCM1: Проверка Ring 0 (10.0.0.1) FAIL TIMEOUT
         PCM2->>PCM1: Проверка Ring 1 (192.168.1.11) FAIL TIMEOUT
     and Проверка внешнего сетевого арбитража
-        PCM2->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=100)
+        PCM2->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=1000)
     end
 
     Note over PCM2: Сервер 2 подтверждает изоляцию Сервера 1 и наличие связи со шлюзом.<br/>Инициируется аварийный Failover на node2
@@ -46,8 +46,8 @@ sequenceDiagram
 
     loop Healthcheck HAProxy2 (:9200)
         HAP2->>SOK2: GET / на 127.0.0.1:9200
-        SOK2->>DB2: psql SELECT pg_is_in_recovery()
-        DB2-->>SOK2: Ответ f (Master)
+        SOK2->>DB2: psql timeout 1.5s: SELECT pg_is_in_recovery(), transaction_read_only
+        DB2-->>SOK2: Ответ 'f, off' (Master, RW активен)
         SOK2-->>HAP2: HTTP/1.1 200 OK Master (node2_db UP)
         HAP2->>DB1: Опрос 10.0.0.1:9200 (Host Unreachable node1_db DOWN)
     end

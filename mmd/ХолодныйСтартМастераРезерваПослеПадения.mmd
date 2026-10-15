@@ -30,7 +30,7 @@ sequenceDiagram
         Eng->>OS1: Старт Сервера 1
         OS1->>OS1: Подъем интерфейсов: eth0 (192.168.1.11) и direct eth1 (10.0.0.1)
         OS1->>CBA1: Запуск cluster-boot-analyzer.service (Before corosync/pacemaker)
-        CBA1->>CBA1: 1. Проверка наличия PGDATA/PG_VERSION<br/>2. RW-тест (.cluster_rw_test)<br/>3. Проверка свободного места (>=5% free)
+        CBA1->>CBA1: 1. Проверка authkey (0400) и .pgpass (0600)<br/>2. Проверка PGDATA и RW-тест<br/>3. Проверка места (>=5%) и inodes (df -i)
         CBA1->>DB1: 4. Чтение pg_controldata (Определение режима старта)
         CBA1-->>OS1: Предстартовые проверки успешно пройдены (exit 0)
         OS1->>CS1: systemd: запуск corosync.service
@@ -41,7 +41,7 @@ sequenceDiagram
         Eng->>OS2: Старт Сервера 2
         OS2->>OS2: Подъем интерфейсов: eth0 (192.168.1.12) и direct eth1 (10.0.0.2)
         OS2->>CBA2: Запуск cluster-boot-analyzer.service (Before corosync/pacemaker)
-        CBA2->>CBA2: 1. Проверка PGDATA/PG_VERSION<br/>2. RW-тест файловой системы<br/>3. Проверка свободного места (>=5% free)
+        CBA2->>CBA2: 1. Проверка authkey (0400) и .pgpass (0600)<br/>2. Проверка PGDATA и RW-тест<br/>3. Проверка места (>=5%) и inodes (df -i)
         CBA2->>DB2: 4. Чтение pg_controldata (Определение режима старта)
         CBA2-->>OS2: Предстартовые проверки успешно пройдены (exit 0)
         OS2->>CS2: systemd: запуск corosync.service
@@ -52,8 +52,8 @@ sequenceDiagram
     CS1->>PCM1: Сосед обнаружен, условие wait_for_all выполнено : Кворум 2/2 ЕСТЬ
     CS2->>PCM2: Сосед обнаружен, условие wait_for_all выполнено : Кворум 2/2 ЕСТЬ
 
-    PCM1->>Eltex: ping-gateway (192.168.1.1) OK (score=100)
-    PCM2->>Eltex: ping-gateway (192.168.1.1) OK (score=100)
+    PCM1->>Eltex: ping-gateway (192.168.1.1) OK (score=1000)
+    PCM2->>Eltex: ping-gateway (192.168.1.1) OK (score=1000)
 
     Note over PCM1, PCM2: PAF (ocf:heartbeat:pgsqlms) Probe: чтение LSN и таймлайнов
     PCM1->>DB1: Probe: pg_controldata (LSN: 0/1A00450)

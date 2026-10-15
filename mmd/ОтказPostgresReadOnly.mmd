@@ -14,9 +14,9 @@ sequenceDiagram
     
     loop Проверка здоровья каждые 2 сек
         HAProxy1->>Check1: GET / HTTP/1.1 (порт 9200)
-        Check1->>PG1: psql SELECT pg_is_in_recovery() | current_setting('transaction_read_only') | age(datfrozenxid)
-        PG1-->>Check1: 'f' | 'on' | 1950000000
-        Note over Check1: pg_is_in_recovery=f, НО transaction_read_only=on<br/>Лимит XID превышен (1.95 млрд >= 1.9 млрд)
+        Check1->>PG1: psql timeout 1.5s: SELECT pg_is_in_recovery(), transaction_read_only
+        PG1-->>Check1: 'f, on'
+        Note over Check1: pg_is_in_recovery=f, НО transaction_read_only=on (Read-Only авария!)
         Check1->>Check1: logger "КРИТИЧЕСКАЯ АВАРИЯ: Master перешел в Read-Only"
         Check1-->>HAProxy1: HTTP/1.1 503 Service Unavailable (Slave)
     end
@@ -40,8 +40,8 @@ sequenceDiagram
 
     loop Опрос роли БД на Сервере 2
         HAProxy2->>Check2: GET / HTTP/1.1 (порт 9200)
-        Check2->>PG2: psql SELECT pg_is_in_recovery() | current_setting('transaction_read_only') | age(datfrozenxid)
-        PG2-->>Check2: 'f' | 'off' | 25000000
+        Check2->>PG2: psql timeout 1.5s: SELECT pg_is_in_recovery(), transaction_read_only
+        PG2-->>Check2: 'f, off' (Master, RW активен)
         Check2-->>HAProxy2: HTTP/1.1 200 OK (Master)
     end
 
