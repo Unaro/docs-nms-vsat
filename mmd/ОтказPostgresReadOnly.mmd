@@ -1,0 +1,52 @@
+sequenceDiagram
+    autonumber
+    participant Client as Клиенты / Пользователи
+    participant VIP as Виртуальный IP (192.168.1.100)
+    participant HAProxy1 as HAProxy (Сервер 1)
+    participant Check1 as db-role-check (Сервер 1)
+    participant PG1 as PostgreSQL Master (Сервер 1)
+    participant PCM as Pacemaker / Corosync
+    participant Check2 as db-role-check (Сервер 2)
+    participant PG2 as PostgreSQL Standby (Сервер 2)
+    participant HAProxy2 as HAProxy (Сервер 2)
+
+    Note over PG1: Нештатная ситуация: отказ autovacuum или XID Wraparound<br/>База переходит в аварийный режим Read-Only (transaction_read_only = on)
+    
+    loop Проверка здоровья каждые 2 сек
+        HAProxy1->>Check1: GET / HTTP/1.1 (порт 9200)
+        Check1->>PG1: psql SELECT pg_is_in_recovery() | current_setting('transaction_read_only') | age(datfrozenxid)
+        PG1-->>Check1: 'f' | 'on' | 1950000000
+        Note over Check1: pg_is_in_recovery=f, НО transaction_read_only=on<br/>Лимит XID превышен (1.95 млрд >= 1.9 млрд)
+        Check1->>Check1: logger "КРИТИЧЕСКАЯ АВАРИЯ: Master перешел в Read-Only"
+        Check1-->>HAProxy1: HTTP/1.1 503 Service Unavailable (Slave)
+    end
+
+    Note over HAProxy1: inter 2s fall 2: порог сбоя превышен (2 x 503)
+    HAProxy1->>HAProxy1: Пометка node1_db_r0 как DOWN
+    HAProxy1->>HAProxy1: on-marked-down shutdown-sessions (сброс клиентских TCP-сессий)
+
+    Note over PCM: Pacemaker pgsqlms агент выполняет мониторинг мастер-роли
+    PCM->>PG1: OCF monitor (проверка возможности записи)
+    PG1-->>PCM: Ошибка записи / Read-Only статус
+    Note over PCM: Фиксация сбоя ресурса pgsql Master на Сервере 1
+
+    PCM->>PG1: Demote Master -> Stopped / Demoted
+    PCM->>PCM: Сравнение LSN и готовности реплики на Сервере 2
+    PCM->>PG2: Promote Standby -> Master (Сервер 2)
+    Note over PG2: Standby успешно промоутирован в Master (RW открыт)
+
+    PCM->>VIP: Миграция VIP на Сервер 2
+    PCM->>HAProxy2: Активация стека сервисов на Сервере 2
+
+    loop Опрос роли БД на Сервере 2
+        HAProxy2->>Check2: GET / HTTP/1.1 (порт 9200)
+        Check2->>PG2: psql SELECT pg_is_in_recovery() | current_setting('transaction_read_only') | age(datfrozenxid)
+        PG2-->>Check2: 'f' | 'off' | 25000000
+        Check2-->>HAProxy2: HTTP/1.1 200 OK (Master)
+    end
+
+    Note over HAProxy2: node2_db_r0 переведен в статус UP
+    Client->>VIP: Клиентский трафик (запись и чтение)
+    VIP->>HAProxy2: Запросы клиентов (:5000)
+    HAProxy2->>PG2: Проксирование транзакций на новый Master (Сервер 2)
+    PG2-->>Client: 200 OK (Транзакции записи выполняются штатно)

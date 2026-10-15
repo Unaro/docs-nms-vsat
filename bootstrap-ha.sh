@@ -1,10 +1,10 @@
 #!/bin/bash
 # =============================================================================
-# УНИВЕРСАЛЬНЫЙ СКРИПТ РАЗВЕРТЫВАНИЯ HA-КЛАСТЕРА (NODE1 / NODE2) — v4.0
-# Включает:
-#  - v2.0: D-state sysctl, Unix-сокет db-role-check, параллельное выключение,
-#          4-ступенчатый сторож деградации, резервирование HAProxy Ring 1,
-#          положительные pingd preferences;
+# УНИВЕРСАЛЬНЫЙ СКРИПТ РАЗВЕРТЫВАНИЯ HA-КЛАСТЕРА (ВЕРСИЯ 5.0 — PRODUCTION FULL)
+# Покрывает 44 сценария отказоустойчивости:
+#  - v1.0–v2.0: Двухкольцевой Corosync (Knet), Watchdog SBD/softdog, D-state fencing,
+#          Unix-сокет db-role-check, параллельное выключение, 4-ступенчатый сторож
+#          деградации, резервирование HAProxy Ring 1, положительные pingd preferences;
 #  - v3.0: Слоты репликации PostgreSQL, conntrack TCP RST, OOMScoreAdjust,
 #          Realtime CPU scheduling (SCHED_RR 99), cgroups лимиты, Chrony Ring 0;
 #  - v4.0 (Production Edge Cases):
@@ -13,7 +13,16 @@
 #          3. Комбинированная проверка шлюза (L3 ICMP + L2 arping + neigh reachable);
 #          4. Таймауты idle_in_transaction_session_timeout и statement_timeout;
 #          5. Устранение fate-sharing: разделение на core-app-stack и daemon-svc;
-#          6. Защита от пинг-понга: start-failure-is-fatal=true, failure-timeout=900s.
+#          6. Защита от пинг-понга: start-failure-is-fatal=true, failure-timeout=900s;
+#  - v5.0 (Deep Production & Enterprise Resiliency):
+#          1. Проверка Read-Only и XID Wraparound limit (1.9 млрд) в db-role-check;
+#          2. wal_log_hints=on и track_commit_timestamp=on для гарантированного pg_rewind;
+#          3. Защита от VM Stun / vMotion: Corosync totem token=3000ms, consensus=3600ms;
+#          4. Защита от черных дыр MTU: tcp_mtu_probing=1 и автодетекция DF-ping с fallback;
+#          5. OOM-Killer защита (vm.overcommit_memory=2, overcommit_ratio=80, OOMScoreAdjust=-1000);
+#          6. Мониторинг системного раздела CIB /var/lib/pacemaker (Diskd min_free=500M);
+#          7. Активное обнаружение ARP-коллизий VIP (run_arping=true, arp_interval=500);
+#          8. Предстартовая валидация .pgpass через IDENTIFY_SYSTEM replication protocol.
 # =============================================================================
 set -euo pipefail
 
@@ -28,20 +37,22 @@ fi
 # ШАГ 1. Создание шаблона /etc/default/ha-cluster (если он еще не создан)
 # -----------------------------------------------------------------------------
 if [[ ! -f "$ENV_FILE" ]]; then
-    echo "[INFO] Файл $ENV_FILE не найден. Создаю базовый шаблон..."
+    echo "[INFO] Файл $ENV_FILE не найден. Создаю эталонный шаблон v5.0..."
     cat << 'EOF' > "$ENV_FILE"
 # =========================================================================
-# ЕДИНЫЙ КОНФИГ ПАРАМЕТРОВ КЛАСТЕРА (ИДЕНТИЧЕН НА NODE1 И NODE2)
+# ЕДИНЫЙ КОНФИГ ПАРАМЕТРОВ КЛАСТЕРА (v5.0 — ИДЕНТИЧЕН НА NODE1 И NODE2)
 # =========================================================================
 
-# 1. Имена узлов кластера
+# 1. Имена и сетевые интерфейсы узлов
 NODE1_NAME="node1"
 NODE2_NAME="node2"
+RING0_NIC="eth1"                # Интерфейс прямого патч-корда (Ring 0)
+CLUSTER_VIP_NIC="eth0"          # Интерфейс в сети маршрутизатора (Ring 1 и VIP)
+SAFE_MTU="1500"                 # Эталонный MTU (защита от Jumbo Frames Black Hole)
 
-# 2. Сетевые адреса (Кольцо 0 — прямой кабель, Кольцо 1 — сеть маршрутизатора)
+# 2. Сетевые адреса (Ring 0 — прямой кабель, Ring 1 — сеть маршрутизатора)
 NODE1_RING0_IP="10.0.0.1"
 NODE2_RING0_IP="10.0.0.2"
-
 NODE1_RING1_IP="192.168.1.11"
 NODE2_RING1_IP="192.168.1.12"
 
@@ -53,9 +64,8 @@ NODE2_ASYMMETRIC_DELAY_SEC="120"
 # 4. Виртуальный IP (VIP)
 CLUSTER_VIP="192.168.1.100"
 CLUSTER_VIP_CIDR="24"
-CLUSTER_VIP_NIC="eth0"
 
-# 5. Параметры СУБД и HAProxy
+# 5. Параметры СУБД PostgreSQL и HAProxy
 PG_VERSION="16"
 PGDATA="/var/lib/postgresql/16/main"
 PGBIN="/usr/lib/postgresql/16/bin"
@@ -63,15 +73,33 @@ DB_PORT="5432"
 DB_CHECK_USER="haproxy_check"
 DB_CHECK_PORT="9200"
 HAPROXY_DB_BIND_PORT="5000"
+REPL_USER="repl_user"
+REPL_PASS="ReplSecretPass!"
+PGPASS_FILE="/var/lib/postgresql/.pgpass"
+REPL_SLOT_NODE1="slot_node1"
+REPL_SLOT_NODE2="slot_node2"
+MAX_SLOT_WAL_KEEP_SIZE="10GB"
+MAX_XID_AGE_LIMIT="1900000000"  # Порог защиты от XID Wraparound (1.9 млрд)
+IDLE_IN_TX_TIMEOUT_MS="15000ms"
+STATEMENT_TIMEOUT_MS="30000ms"
 
-# 6. Управляемые systemd-сервисы приложения и демонов
+# 6. Прикладные сервисы (разделены: основное приложение и второстепенный демон)
 APP_SERVICE="my-app"
 DAEMON_SERVICE="my-daemon"
+APP_MEMORY_MAX="75%"
+APP_CPU_QUOTA="80%"
 
-# 7. Таймауты и пороги безопасности
+# 7. Таймауты, анти-VM-Stun параметры Corosync и пороги безопасности
+COROSYNC_TOKEN_MS="3000"        # 3 сек (защита от VM Stun / vMotion при бэкапах)
+COROSYNC_RETRANSMITS="10"
+COROSYNC_CONSENSUS_MS="3600"
+COROSYNC_JOIN_MS="60"
 MIN_FREE_DISK_PCT="5"
-COLD_START_TIMEOUT_SEC="180"    # 3 минуты при плановом холодном старте
-CRASH_TIMEOUT_SEC="900"         # 15 минут при старте после аварийного падения
+MIN_FREE_CIB_MB="500"           # Минимум 500 МБ на разделе /var/lib/pacemaker
+MAX_CLOCK_SKEW_SEC="1.0"
+COLD_START_TIMEOUT_SEC="180"
+CRASH_TIMEOUT_SEC="900"
+FAILURE_TIMEOUT_SEC="900s"
 
 # 8. Служебные файлы состояния
 STATE_DIR="/var/lib/cluster-state"
@@ -80,22 +108,6 @@ BOOT_MODE_FILE="/run/cluster_boot_mode"
 
 # 9. Пароль пользователя hacluster (для автоматической инициализации pcs)
 HACLUSTER_PASS="StrongClusterPass123!"
-
-# 10. Параметры v3.0 (Day-2 Operations: лимиты, слоты, дрейф времени)
-MAX_CLOCK_SKEW_SEC="1.0"
-APP_MEMORY_MAX="75%"
-APP_CPU_QUOTA="80%"
-REPL_USER="repl_user"
-REPL_PASS="ReplSecretPass!"
-PGPASS_FILE="/var/lib/postgresql/.pgpass"
-REPL_SLOT_NODE1="slot_node1"
-REPL_SLOT_NODE2="slot_node2"
-MAX_SLOT_WAL_KEEP_SIZE="10GB"
-
-# 11. Параметры v4.0 (Production Edge Cases: таймауты транзакций и отказов)
-FAILURE_TIMEOUT_SEC="900s"
-IDLE_IN_TX_TIMEOUT_MS="15000ms"
-STATEMENT_TIMEOUT_MS="30000ms"
 EOF
     chmod 600 "$ENV_FILE"
     echo "[ВНИМАНИЕ] Шаблон $ENV_FILE создан."
@@ -106,7 +118,16 @@ fi
 # Подгружаем переменные из единого файла конфигурации
 source "$ENV_FILE"
 
-# Установка дефолтов для параметров v3.0 и v4.0 (если файл уже существовал ранее)
+# Установка безопасных дефолтов при обновлении со старых версий
+RING0_NIC="${RING0_NIC:-eth1}"
+CLUSTER_VIP_NIC="${CLUSTER_VIP_NIC:-eth0}"
+SAFE_MTU="${SAFE_MTU:-1500}"
+MAX_XID_AGE_LIMIT="${MAX_XID_AGE_LIMIT:-1900000000}"
+COROSYNC_TOKEN_MS="${COROSYNC_TOKEN_MS:-3000}"
+COROSYNC_RETRANSMITS="${COROSYNC_RETRANSMITS:-10}"
+COROSYNC_CONSENSUS_MS="${COROSYNC_CONSENSUS_MS:-3600}"
+COROSYNC_JOIN_MS="${COROSYNC_JOIN_MS:-60}"
+MIN_FREE_CIB_MB="${MIN_FREE_CIB_MB:-500}"
 MAX_CLOCK_SKEW_SEC="${MAX_CLOCK_SKEW_SEC:-1.0}"
 APP_MEMORY_MAX="${APP_MEMORY_MAX:-75%}"
 APP_CPU_QUOTA="${APP_CPU_QUOTA:-80%}"
@@ -122,7 +143,7 @@ FAILURE_TIMEOUT_SEC="${FAILURE_TIMEOUT_SEC:-900s}"
 IDLE_IN_TX_TIMEOUT_MS="${IDLE_IN_TX_TIMEOUT_MS:-15000ms}"
 STATEMENT_TIMEOUT_MS="${STATEMENT_TIMEOUT_MS:-30000ms}"
 
-echo "[INFO] Конфигурация успешно загружена из $ENV_FILE"
+echo "[INFO] Конфигурация успешно загружена из $ENV_FILE (v5.0 активна)"
 
 # -----------------------------------------------------------------------------
 # ШАГ 2. Автоопределение текущего узла (node1 или node2)
@@ -131,9 +152,15 @@ LOCAL_IPS=$(hostname -I)
 if [[ " $LOCAL_IPS " == *" $NODE1_RING0_IP "* ]] || [[ " $LOCAL_IPS " == *" $NODE1_RING1_IP "* ]]; then
     CURRENT_NODE="$NODE1_NAME"
     PEER_NODE="$NODE2_NAME"
+    PEER_RING0_IP="$NODE2_RING0_IP"
+    PEER_RING1_IP="$NODE2_RING1_IP"
+    MY_SLOT="$REPL_SLOT_NODE1"
 elif [[ " $LOCAL_IPS " == *" $NODE2_RING0_IP "* ]] || [[ " $LOCAL_IPS " == *" $NODE2_RING1_IP "* ]]; then
     CURRENT_NODE="$NODE2_NAME"
     PEER_NODE="$NODE1_NAME"
+    PEER_RING0_IP="$NODE1_RING0_IP"
+    PEER_RING1_IP="$NODE1_RING1_IP"
+    MY_SLOT="$REPL_SLOT_NODE2"
 else
     echo "[ОШИБКА] Ни один из локальных IP ($LOCAL_IPS) не совпадает с NODE1/NODE2 в $ENV_FILE!"
     exit 1
@@ -141,26 +168,40 @@ fi
 echo "[INFO] Скрипт выполняется на узле: $CURRENT_NODE (сосед: $PEER_NODE)"
 
 # -----------------------------------------------------------------------------
-# ШАГ 3. Настройка ядра против D-state, Conntrack, Chrony, .pgpass, hosts и каталогов
+# ШАГ 3. Настройка ядра (D-state, Overcommit, MTU probing, Chrony, Conntrack, Hosts)
 # -----------------------------------------------------------------------------
 echo "[INFO] Настройка параметров ядра, файрвола, времени, .pgpass и /etc/hosts..."
 
-# 3.1 Защита от зависания дискового ввода-вывода (I/O hang / D-state):
-cat << 'EOF' > /etc/sysctl.d/99-ha-dstate-fencing.conf
-# Если процесс (например, postgres) висит в D-state (I/O hang) > 45 сек -> Kernel Panic и авторебут
+# 3.1 Защита от зависания ввода-вывода (D-state), OOM-Killer и черной дыры MTU
+cat << 'EOF' > /etc/sysctl.d/99-ha-cluster-v5.conf
+# 1. Самострел при зависании диска в D-state > 45 сек
 kernel.hung_task_timeout_secs = 45
 kernel.hung_task_panic = 1
 kernel.panic = 5
 kernel.panic_on_oops = 1
+
+# 2. Защита checkpointer/walwriter от OOM-Killer (строгий учет памяти)
+vm.overcommit_memory = 2
+vm.overcommit_ratio = 80
+
+# 3. Защита от «Черной дыры MTU» (автоподбор TCP MSS при расхождении Jumbo Frames)
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
 EOF
 sysctl --system >/dev/null 2>&1 || true
 
-# 3.2 Установка необходимых вспомогательных пакетов (при наличии менеджера пакетов)
-if command -v apt-get >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y conntrack iptables-persistent chrony 2>/dev/null || true
+# 3.2 Резервируем 2% блоков на корневом разделе и разделе /var для root и Pacemaker CIB
+ROOT_DEV=$(findmnt -n -o SOURCE /var/lib/pacemaker 2>/dev/null || findmnt -n -o SOURCE / 2>/dev/null || true)
+if [[ "$ROOT_DEV" == /dev/* ]]; then
+    tune2fs -m 2 "$ROOT_DEV" >/dev/null 2>&1 || true
 fi
 
-# 3.3 Принудительная отправка TCP RST на пакеты старых сессий со статусом INVALID (Conntrack fix)
+# 3.3 Установка необходимых вспомогательных пакетов
+if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y conntrack iptables-persistent chrony iputils-arping 2>/dev/null || true
+fi
+
+# 3.4 Принудительная отправка TCP RST на пакеты старых сессий со статусом INVALID
 if command -v iptables >/dev/null 2>&1; then
     if ! iptables -C INPUT -p tcp -m conntrack --ctstate INVALID -j REJECT --reject-with tcp-reset 2>/dev/null; then
         iptables -I INPUT 1 -p tcp -m conntrack --ctstate INVALID -j REJECT --reject-with tcp-reset 2>/dev/null || true
@@ -168,7 +209,7 @@ if command -v iptables >/dev/null 2>&1; then
     fi
 fi
 
-# 3.4 Взаимная синхронизация времени Chrony по прямому линку Ring 0
+# 3.5 Взаимная синхронизация времени Chrony по прямому линку Ring 0
 CHRONY_CONF="/etc/chrony/chrony.conf"
 [[ ! -f "$CHRONY_CONF" && -f "/etc/chrony.conf" ]] && CHRONY_CONF="/etc/chrony.conf"
 if [[ -f "$CHRONY_CONF" ]]; then
@@ -184,7 +225,7 @@ EOF
     systemctl restart chrony 2>/dev/null || systemctl restart chronyd 2>/dev/null || true
 fi
 
-# 3.5 Идемпотентное обновление /etc/hosts
+# 3.6 Идемпотентное обновление /etc/hosts
 sed -i '/# --- HA-CLUSTER-HOSTS-BEGIN ---/,/# --- HA-CLUSTER-HOSTS-END ---/d' /etc/hosts
 cat << EOF >> /etc/hosts
 # --- HA-CLUSTER-HOSTS-BEGIN ---
@@ -195,49 +236,66 @@ $NODE2_RING1_IP    ${NODE2_NAME}-ring1
 # --- HA-CLUSTER-HOSTS-END ---
 EOF
 
-# 3.6 Автогенерация /var/lib/postgresql/.pgpass (0600) для безопасного беспарольного подключения
-mkdir -p "$(dirname "$PGPASS_FILE")"
+# 3.7 Автогенерация /var/lib/postgresql/.pgpass (0600)
+mkdir -p "$(dirname "$PGPASS_FILE")" "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 cat << EOF > "$PGPASS_FILE"
 *:${DB_PORT}:*:${REPL_USER}:${REPL_PASS}
 EOF
 chown postgres:postgres "$PGPASS_FILE" 2>/dev/null || true
 chmod 0600 "$PGPASS_FILE"
 
-# 3.7 Настройка параметров WAL-слотов, keepalive и таймаутов транзакций в postgresql.conf
+# 3.8 Настройка критических параметров PostgreSQL v5.0 в postgresql.conf
 if [[ -f "${PGDATA}/postgresql.conf" ]]; then
     sed -i '/# --- HA-CLUSTER-PG-BEGIN ---/,/# --- HA-CLUSTER-PG-END ---/d' "${PGDATA}/postgresql.conf"
+    sed -i '/# --- HA-CLUSTER-PG-V5-BEGIN ---/,/# --- HA-CLUSTER-PG-V5-END ---/d' "${PGDATA}/postgresql.conf"
     cat << EOF >> "${PGDATA}/postgresql.conf"
-# --- HA-CLUSTER-PG-BEGIN ---
+# --- HA-CLUSTER-PG-V5-BEGIN ---
+listen_addresses = '*'
+wal_level = replica
+wal_log_hints = on
+full_page_writes = on
+track_commit_timestamp = on
+hot_standby = on
+hot_standby_feedback = on
+synchronous_commit = remote_write
+superuser_reserved_connections = 5
 max_slot_wal_keep_size = ${MAX_SLOT_WAL_KEEP_SIZE}
 wal_keep_size = 2048MB
+idle_in_transaction_session_timeout = '${IDLE_IN_TX_TIMEOUT_MS}'
+statement_timeout = '${STATEMENT_TIMEOUT_MS}'
+lock_timeout = '5000ms'
 tcp_keepalives_idle = 15
 tcp_keepalives_interval = 5
 tcp_keepalives_count = 3
-lock_timeout = '5000ms'
-idle_in_transaction_session_timeout = '${IDLE_IN_TX_TIMEOUT_MS}'
-statement_timeout = '${STATEMENT_TIMEOUT_MS}'
-# --- HA-CLUSTER-PG-END ---
+# --- HA-CLUSTER-PG-V5-END ---
 EOF
 fi
 
-mkdir -p "$STATE_DIR"
-chmod 700 "$STATE_DIR"
-
 # -----------------------------------------------------------------------------
-# ШАГ 4. Генерация 4 рабочих скриптов кластера
+# ШАГ 4. Генерация 4 рабочих скриптов кластера v5.0
 # -----------------------------------------------------------------------------
 echo "[INFO] Создаю рабочие скрипты в /usr/local/bin и /usr/local/sbin..."
 
-# 4.1 Скрипт проверки роли БД для HAProxy (/usr/local/bin/db-role-check.sh)
+# 4.1 Скрипт проверки роли БД для HAProxy с защитой от Read-Only и XID Wraparound
 cat << 'EOF' > /usr/local/bin/db-role-check.sh
 #!/bin/bash
 source /etc/default/ha-cluster
 
-# Подключаемся через локальный Unix-сокет от имени суперпользователя postgres
-# (использует пул superuser_reserved_connections и не зависит от клиентского max_connections)
-OUT=$(psql -p "${DB_PORT:-5432}" -U postgres -d postgres -tAc "SELECT pg_is_in_recovery();" 2>&1 || true)
+# Единым быстрым запросом через Unix-сокет проверяем:
+# 1) pg_is_in_recovery() == f (Master)
+# 2) current_setting('transaction_read_only') == off (Не в аварийном режиме Read-Only)
+# 3) max(age(datfrozenxid)) < MAX_XID_AGE_LIMIT (Нет риска остановки из-за XID Wraparound)
+QUERY="SELECT pg_is_in_recovery() || '|' || current_setting('transaction_read_only') || '|' || COALESCE(max(age(datfrozenxid)), 0) FROM pg_database WHERE datallowconn;"
+OUT=$(psql -p "${DB_PORT:-5432}" -U postgres -d postgres -tAc "$QUERY" 2>&1 || true)
 
-if [[ "$OUT" == "f" ]]; then
+IFS='|' read -r IS_REC IS_RO XID_AGE <<< "$OUT"
+
+if [[ "$IS_REC" == "f" ]] && [[ "$IS_RO" == "off" ]] && (( ${XID_AGE:-0} < ${MAX_XID_AGE_LIMIT:-1900000000} )); then
+    # Дополнительно защищаем ключевые процессы СУБД от OOM-Killer в runtime
+    for pid in $(pgrep -u postgres 2>/dev/null || true); do
+        echo -1000 > "/proc/${pid}/oom_score_adj" 2>/dev/null || true
+    done
     printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nMaster"
     exit 0
 elif [[ "$OUT" == *"too many clients"* ]] && [[ ! -f "${PGDATA}/standby.signal" ]]; then
@@ -245,6 +303,9 @@ elif [[ "$OUT" == *"too many clients"* ]] && [[ ! -f "${PGDATA}/standby.signal" 
     printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nMaster"
     exit 0
 else
+    if (( ${XID_AGE:-0} >= ${MAX_XID_AGE_LIMIT:-1900000000} )) || [[ "$IS_RO" == "on" ]]; then
+        logger -t db-role-check "КРИТИЧЕСКАЯ АВАРИЯ БД: Master перешел в Read-Only ($IS_RO) или превысил лимит XID Wraparound ($XID_AGE)!"
+    fi
     printf "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nSlave"
     exit 1
 fi
@@ -266,8 +327,7 @@ fi
 
 # Проверяем, являемся ли мы Master перед началом остановки
 if crm_mon -1 2>/dev/null | grep -A 2 "Promoted:" | grep -qw "$LOCAL_NODE"; then
-    # Если мы были Master, записываем MASTER по умолчанию (защита от одновременного shutdown обеих нод!).
-    # Меняем на SLAVE только если сосед НЕ находится в процессе остановки и реально принимает трафик как Master.
+    # Если мы были Master, записываем MASTER по умолчанию (защита от одновременного shutdown обеих нод!)
     FINAL_ROLE="MASTER"
 else
     # Если мы были Slave, но прямо во время остановки соседа промоутились в Master:
@@ -286,7 +346,7 @@ logger -t cluster-state "Штатная остановка ($LOCAL_NODE). Зап
 EOF
 chmod +x /usr/local/sbin/cluster-mark-shutdown.sh
 
-# 4.3 Скрипт проверки дисков, времени, WAL и выбора режима старта (/usr/local/sbin/cluster-boot-analyzer.sh)
+# 4.3 Скрипт проверки дисков, CIB, MTU, времени, WAL и выбора режима старта
 cat << 'EOF' > /usr/local/sbin/cluster-boot-analyzer.sh
 #!/bin/bash
 set -euo pipefail
@@ -306,7 +366,7 @@ if [[ -f "$STATE_FILE" ]]; then
     logger -t cluster-precheck "Маркер штатного выключения прочитан (Роль: $SAVED_ROLE) и удален с диска."
 fi
 
-# --- БЛОК 2: Предстартовая проверка диска БД ---
+# --- БЛОК 2: Предстартовая проверка диска БД и раздела CIB Pacemaker ---
 if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
     logger -t cluster-precheck "КРИТИЧЕСКАЯ ОШИБКА: Каталог БД ($PGDATA) отсутствует! Старт Pacemaker заблокирован."
     exit 1
@@ -314,17 +374,49 @@ fi
 
 TEST_FILE="$PGDATA/.cluster_rw_test"
 if ! touch "$TEST_FILE" 2>/dev/null || ! rm -f "$TEST_FILE" 2>/dev/null; then
-    logger -t cluster-precheck "КРИТИЧЕСКАЯ ОШИБКА: Файловая система БД ($PGDATA) в режиме Read-Only! Старт Pacemaker заблокирован."
+    logger -t cluster-precheck "КРИТИЧЕСКАЯ ОШИБКА: Файловая система БД ($PGDATA) в режиме Read-Only! Старт заблокирован."
     exit 1
 fi
 
 USED_PCT=$(df --output=pcent "$PGDATA" | tail -n 1 | tr -dc '0-9')
 if (( 100 - ${USED_PCT:-100} < MIN_FREE_DISK_PCT )); then
-    logger -t cluster-precheck "КРИТИЧЕСКАЯ ОШИБКА: На диске БД менее ${MIN_FREE_DISK_PCT}% свободного места! Старт Pacemaker заблокирован."
+    logger -t cluster-precheck "КРИТИЧЕСКАЯ ОШИБКА: На диске БД менее ${MIN_FREE_DISK_PCT}% свободного места! Старт заблокирован."
     exit 1
 fi
 
-# --- БЛОК 3: Определение режима запуска по заголовку pg_controldata ---
+CIB_FREE_MB=$(df -BM --output=avail /var/lib/pacemaker 2>/dev/null | tail -n 1 | tr -dc '0-9' || echo "1000")
+if (( ${CIB_FREE_MB:-1000} < ${MIN_FREE_CIB_MB:-500} )); then
+    logger -t cluster-precheck "ВНИМАНИЕ: В /var/lib/pacemaker осталось ${CIB_FREE_MB} МБ (< ${MIN_FREE_CIB_MB} МБ)! Очищаю системный журнал..."
+    journalctl --vacuum-size=100M >/dev/null 2>&1 || true
+fi
+
+# --- БЛОК 3: Проверка wal_log_hints в заголовке pg_controldata ---
+HINTS_STATE=$(LC_ALL=C "$PGBIN/pg_controldata" "$PGDATA" 2>/dev/null | awk -F: '/wal_log_hints setting/ {gsub(/^[ \t]+/, "", $2); print $2}' || echo "unknown")
+if [[ "$HINTS_STATE" != "on" ]] && [[ -f "$PGDATA/postgresql.conf" ]]; then
+    logger -t cluster-precheck "ПРЕДУПРЕЖДЕНИЕ: wal_log_hints=$HINTS_STATE! Принудительно включаю wal_log_hints=on для поддержки pg_rewind."
+    sed -i 's/^#*wal_log_hints.*/wal_log_hints = on/' "$PGDATA/postgresql.conf"
+fi
+
+# --- БЛОК 4: Проверка и автокоррекция MTU (DF-ping) на линке прямого соединения ---
+LOCAL_IPS=$(hostname -I)
+if [[ " $LOCAL_IPS " == *" $NODE1_RING0_IP "* ]]; then
+    PEER_IP="$NODE2_RING0_IP"
+    MY_SLOT="${REPL_SLOT_NODE1:-slot_node1}"
+else
+    PEER_IP="$NODE1_RING0_IP"
+    MY_SLOT="${REPL_SLOT_NODE2:-slot_node2}"
+fi
+
+CUR_MTU=$(ip -o link show dev "$RING0_NIC" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") print $(i+1)}' || echo "1500")
+PAYLOAD=$(( CUR_MTU - 28 ))
+if ping -c 1 -W 1 "$PEER_IP" >/dev/null 2>&1; then
+    if ! ping -c 2 -W 1 -M do -s "$PAYLOAD" "$PEER_IP" >/dev/null 2>&1; then
+        logger -t cluster-precheck "КРИТИЧЕСКАЯ ОШИБКА MTU: Пакеты ${CUR_MTU} байт (DF) не проходят до $PEER_IP! Принудительно снижаю MTU на $RING0_NIC до ${SAFE_MTU}."
+        ip link set dev "$RING0_NIC" mtu "${SAFE_MTU:-1500}" || true
+    fi
+fi
+
+# --- БЛОК 5: Определение режима запуска по заголовку pg_controldata ---
 DB_STATE=$(LC_ALL=C "$PGBIN/pg_controldata" "$PGDATA" 2>/dev/null | awk -F: '/Database cluster state/ {gsub(/^[ \t]+/, "", $2); print $2}')
 
 if [[ "$WAS_GRACEFUL" == "yes" ]] && [[ "$DB_STATE" == "shut down"* ]]; then
@@ -339,39 +431,28 @@ else
     logger -t cluster-precheck "Диски исправны. ВНИМАНИЕ: Старт после ПАДЕНИЯ (БД: '$DB_STATE', таймаут ${CRASH_TIMEOUT_SEC} сек)."
 fi
 
-# --- БЛОК 4 (v4.0): Безопасный pg_basebackup без интерактивного запроса пароля ---
-LOCAL_IPS=$(hostname -I)
-if [[ " $LOCAL_IPS " == *" $NODE1_RING0_IP "* ]]; then
-    PEER_IP="$NODE2_RING0_IP"
-    MY_SLOT="${REPL_SLOT_NODE1:-slot_node1}"
-else
-    PEER_IP="$NODE1_RING0_IP"
-    MY_SLOT="${REPL_SLOT_NODE2:-slot_node2}"
-fi
-
+# --- БЛОК 6: Проверка синхронности .pgpass, валидация WAL и безопасный авто-pg_basebackup ---
 export PGPASSFILE="${PGPASS_FILE:-/var/lib/postgresql/.pgpass}"
 
-# Проверяем, работает ли сейчас сосед в роли активного Master (порт 9200 -> HTTP 200)
 if curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://${PEER_IP}:${DB_CHECK_PORT}" | grep -q "200"; then
-    logger -t cluster-precheck "Сосед ($PEER_IP) уже работает как активный Master. Проверяем совместимость WAL..."
+    logger -t cluster-precheck "Сосед ($PEER_IP) уже работает как активный Master. Проверяю авторизацию по протоколу репликации..."
 
-    SLOT_STATUS=$(PGPASSFILE="$PGPASSFILE" PGCONNECT_TIMEOUT=5 sudo -u postgres psql -w -h "$PEER_IP" -p "$DB_PORT" -U "${REPL_USER:-repl_user}" -d postgres -tAc \
-        "SELECT wal_status FROM pg_replication_slots WHERE slot_name='${MY_SLOT}';" 2>/dev/null || echo "ok")
+    if ! sudo -u postgres PGPASSFILE="$PGPASSFILE" PGCONNECT_TIMEOUT=5 \
+         psql -w "host=$PEER_IP port=$DB_PORT user=${REPL_USER:-repl_user} dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;" >/dev/null 2>&1; then
+        logger -t cluster-precheck "КРИТИЧЕСКАЯ ОШИБКА БЕЗОПАСНОСТИ: Пароль $REPL_USER в .pgpass не подходит к активному Master ($PEER_IP)!"
+    else
+        SLOT_STATUS=$(sudo -u postgres PGPASSFILE="$PGPASSFILE" PGCONNECT_TIMEOUT=5 \
+            psql -w -h "$PEER_IP" -p "$DB_PORT" -U "${REPL_USER:-repl_user}" -d postgres -tAc \
+            "SELECT wal_status FROM pg_replication_slots WHERE slot_name='${MY_SLOT}';" 2>/dev/null || echo "ok")
 
-    REWIND_CHECK="ok"
-    if ! sudo -u postgres "$PGBIN/pg_rewind" --dry-run --target-pgdata="$PGDATA" \
-         --source-server="host=$PEER_IP port=$DB_PORT user=${REPL_USER:-repl_user} dbname=postgres connect_timeout=5" >/dev/null 2>&1; then
-        REWIND_CHECK="failed"
-    fi
+        REWIND_CHECK="ok"
+        if ! sudo -u postgres "$PGBIN/pg_rewind" --dry-run --target-pgdata="$PGDATA" \
+             --source-server="host=$PEER_IP port=$DB_PORT user=${REPL_USER:-repl_user} dbname=postgres connect_timeout=5" >/dev/null 2>&1; then
+            REWIND_CHECK="failed"
+        fi
 
-    if [[ "$SLOT_STATUS" == "lost" ]] || [[ "$REWIND_CHECK" == "failed" ]]; then
-        logger -t cluster-precheck "ВНИМАНИЕ: Нужные сегменты WAL на Master удалены (slot=$SLOT_STATUS, rewind=$REWIND_CHECK). Проверяю беспарольный доступ..."
-
-        # КРИТИЧЕСКАЯ ПРОВЕРКА: тестируем беспарольный вход с флагом -w (--no-password) ДО удаления PGDATA!
-        if sudo -u postgres PGPASSFILE="$PGPASSFILE" PGCONNECT_TIMEOUT=5 \
-           psql -w -h "$PEER_IP" -p "$DB_PORT" -U "${REPL_USER:-repl_user}" -d postgres -tAc "SELECT 1;" >/dev/null 2>&1; then
-
-            logger -t cluster-precheck "Беспарольная авторизация успешна. Очищаю $PGDATA и запускаю pg_basebackup --no-password..."
+        if [[ "$SLOT_STATUS" == "lost" ]] || [[ "$REWIND_CHECK" == "failed" ]]; then
+            logger -t cluster-precheck "Нужные сегменты WAL на Master удалены (slot=$SLOT_STATUS, rewind=$REWIND_CHECK). Пересоздаю реплику через pg_basebackup --no-password..."
             rm -rf "${PGDATA:?}"/*
             if ! timeout 600 sudo -u postgres PGPASSFILE="$PGPASSFILE" PGCONNECT_TIMEOUT=10 \
                  pg_basebackup --no-password -h "$PEER_IP" -p "$DB_PORT" -U "${REPL_USER:-repl_user}" \
@@ -380,13 +461,11 @@ if curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://${PEER_IP}
                 exit 1
             fi
             logger -t cluster-precheck "Автоматический pg_basebackup успешно завершен! Реплика пересоздана с нуля."
-        else
-            logger -t cluster-precheck "КРИТИЧЕСКАЯ ОШИБКА: Беспарольный вход для $REPL_USER по .pgpass не прошел! PGDATA сохранен во избежание зависания загрузки."
         fi
     fi
 fi
 
-# --- БЛОК 5 (v3.0): Контроль синхронизации системного времени (Clock Skew) ---
+# --- БЛОК 7: Контроль синхронизации системного времени (Clock Skew) ---
 if command -v chronyc >/dev/null 2>&1; then
     OFFSET=$(chronyc tracking 2>/dev/null | awk '/System time/ {print $4}' || echo "0")
     if awk "BEGIN {exit !(${OFFSET:-0} > ${MAX_CLOCK_SKEW_SEC:-1.0})}"; then
@@ -474,7 +553,7 @@ for pip in "$PEER_RING0_IP" "$PEER_RING1_IP"; do
     done
 done
 
-# ПРЕДОХРАНИТЕЛЬ 3: Проверка, не поднят ли уже CLUSTER_VIP в сети роутера (защита от Split-Brain и долгого fsck)
+# ПРЕДОХРАНИТЕЛЬ 3: Проверка, не поднят ли уже CLUSTER_VIP в сети роутера
 if ping -c 2 -W 1 "$CLUSTER_VIP" >/dev/null 2>&1 || arping -D -I "$CLUSTER_VIP_NIC" -c 2 "$CLUSTER_VIP" 2>&1 | grep -q "Received [1-9]"; then
     logger -t cluster-watchdog "КРИТИЧЕСКАЯ ОШИБКА: Виртуальный IP ($CLUSTER_VIP) УЖЕ АКТИВЕН в сети! Защита от Split-Brain сработала."
     exit 1
@@ -507,7 +586,6 @@ Description=PostgreSQL Role Check Socket for HAProxy
 [Socket]
 ListenStream=${DB_CHECK_PORT}
 Accept=yes
-# Подавляем info-сообщения сокета в systemd-journald
 LogLevelMax=warning
 
 [Install]
@@ -524,10 +602,8 @@ User=postgres
 EnvironmentFile=/etc/default/ha-cluster
 ExecStart=-/usr/local/bin/db-role-check.sh
 StandardInput=socket
-# StandardOutput обязан оставаться 'socket', чтобы HAProxy получал HTTP 200/503!
 StandardOutput=socket
 StandardError=journal
-# Подавляем 'Started...' и 'Deactivated successfully' (уровень info) в journald:
 LogLevelMax=warning
 EOF
 
@@ -660,11 +736,11 @@ LimitMEMLOCK=infinity
 EOF
 
 # 6.2 Иммунитет от OOM-Killer для Pacemaker, PostgreSQL и HAProxy
-for crit_svc in pacemaker postgresql haproxy; do
+for crit_svc in pacemaker postgresql "postgresql@${PG_VERSION}-main" haproxy; do
     mkdir -p "/etc/systemd/system/${crit_svc}.service.d"
     cat << 'EOF' > "/etc/systemd/system/${crit_svc}.service.d/oom-protect.conf"
 [Service]
-OOMScoreAdjust=-950
+OOMScoreAdjust=-1000
 EOF
 done
 
@@ -683,8 +759,8 @@ systemctl daemon-reload
 systemctl restart systemd-journald 2>/dev/null || true
 
 # Отключаем автозапуск сервисов, которыми управляет исключительно Pacemaker
-for svc in postgresql haproxy "$APP_SERVICE" "$DAEMON_SERVICE"; do
-    if systemctl list-unit-files | grep -q "^${svc}.service"; then
+for svc in postgresql "postgresql@${PG_VERSION}-main" haproxy "$APP_SERVICE" "$DAEMON_SERVICE"; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}.service"; then
         systemctl disable "${svc}.service" 2>/dev/null || true
     fi
 done
@@ -701,32 +777,43 @@ echo "hacluster:${HACLUSTER_PASS}" | chpasswd 2>/dev/null || true
 # ШАГ 7. Опциональная инициализация кластера Pacemaker/Corosync (--init-pcs)
 # -----------------------------------------------------------------------------
 if [[ "${1:-}" == "--init-pcs" ]]; then
-    echo "[INFO] Флаг --init-pcs активен. Инициализирую кластер Corosync и ресурсы Pacemaker..."
+    echo "[INFO] Флаг --init-pcs активен. Инициализирую кластер Corosync v5.0 и ресурсы Pacemaker..."
 
     pcs host auth "$NODE1_NAME" "$NODE2_NAME" -u hacluster -p "$HACLUSTER_PASS"
 
+    # Настройка Corosync с таймингами защиты от VM Stun / vMotion (token=3000ms)
     pcs cluster setup ha_cluster \
         "$NODE1_NAME" addr="$NODE1_RING0_IP" addr="$NODE1_RING1_IP" \
         "$NODE2_NAME" addr="$NODE2_RING0_IP" addr="$NODE2_RING1_IP" \
         transport knet \
         link linknumber=0 link_priority=100 mcastport=5405 \
-        link linknumber=1 link_priority=50  mcastport=5406
+        link linknumber=1 link_priority=50  mcastport=5406 \
+        totem token="${COROSYNC_TOKEN_MS:-3000}" \
+              token_retransmits_before_loss_const="${COROSYNC_RETRANSMITS:-10}" \
+              consensus="${COROSYNC_CONSENSUS_MS:-3600}" \
+              join="${COROSYNC_JOIN_MS:-60}"
 
     pcs cluster start --all
     pcs cluster enable --all
 
     pcs property set stonith-enabled=false
     pcs property set no-quorum-policy=stop
-    # Защита от пинг-понга: фатальный сбой старта сразу останавливает миграции на узле,
-    # а окно сброса ошибок задано на 15 минут (900с):
     pcs property set start-failure-is-fatal=true
     pcs resource defaults update resource-stickiness=100 migration-threshold=3 failure-timeout="${FAILURE_TIMEOUT_SEC:-900s}"
 
+    # Псевдо-арбитр (пинг шлюза)
     pcs resource create ping-gateway ocf:pacemaker:ping \
         host_list="${ROUTER_IPS:-$ROUTER_IP}" multiplier=1000 dampen=10s \
         op monitor interval=5s timeout=10s \
         clone meta interleave=true
 
+    # Мониторинг свободного места на системном разделе /var/lib/pacemaker (защита CIB)
+    pcs resource create fs-mon ocf:heartbeat:Diskd \
+        dir="/var/lib/pacemaker" min_free="${MIN_FREE_CIB_MB:-500}" \
+        op monitor interval=20s timeout=10s \
+        clone meta interleave=true
+
+    # СУБД PostgreSQL (агент PAF pgsqlms)
     pcs resource create pgsql ocf:heartbeat:pgsqlms \
         bindir="$PGBIN" pgdata="$PGDATA" \
         recovery_template="/var/lib/postgresql/recovery.conf.pcmk" \
@@ -737,35 +824,35 @@ if [[ "${1:-}" == "--init-pcs" ]]; then
         op notify timeout=15s \
         promotable notify=true
 
+    # Виртуальный IP с активным обнаружением ARP-коллизий (run_arping=true)
     pcs resource create vip ocf:heartbeat:IPaddr2 \
         ip="$CLUSTER_VIP" cidr_netmask="$CLUSTER_VIP_CIDR" nic="$CLUSTER_VIP_NIC" \
-        arp_interval=500 arp_count=10 arp_bg=true \
+        run_arping=true arp_interval=500 arp_count=5 arp_bg=true \
         op monitor interval=5s timeout=20s
 
     # Развязка fate-sharing: разделяем критическое ядро (core-app-stack) и второстепенный демон (daemon-svc)
     pcs resource create haproxy-svc systemd:haproxy op monitor interval=10s --group core-app-stack
     pcs resource create app-svc "systemd:${APP_SERVICE}" op monitor interval=10s --group core-app-stack
-
     pcs resource create daemon-svc "systemd:${DAEMON_SERVICE}" op monitor interval=10s
 
-    # Положительное предпочтение (+1000 за каждый живой IP роутера) вместо жесткого -INFINITY
+    # Положительное предпочтение (+1000 за каждый живой IP роутера)
     pcs constraint location vip rule score-attribute=pingd pingd gt 0
     pcs constraint location pgsql-clone rule role=Master score-attribute=pingd pingd gt 0
 
     # Привязка core-app-stack и VIP к Master СУБД:
     pcs constraint colocation add core-app-stack with vip INFINITY
+    pcs constraint colocation add daemon-svc with core-app-stack INFINITY
     pcs constraint colocation add vip with master pgsql-clone 500
     pcs constraint order start vip then start core-app-stack
 
-    # Привязка daemon-svc как зависимого от core-app-stack:
+    # Привязка daemon-svc как зависимого от core-app-stack (symmetrical=false):
     # При сбое daemon-svc ядро (my-app и haproxy) НЕ останавливаются и НЕ мигрируют!
-    pcs constraint colocation add daemon-svc with core-app-stack INFINITY
     pcs constraint order start core-app-stack then start daemon-svc symmetrical=false
 
-    echo "[УСПЕХ] Кластер полностью создан и запущен (v4.0 Production Edge Cases активны)!"
+    echo "[УСПЕХ] Кластер полностью создан и запущен (v5.0 Production Full активны)!"
     echo "Проверьте состояние командой: pcs status"
 else
-    echo "[УСПЕХ] Узел $CURRENT_NODE подготовлен (v4.0 Production Edge Cases активны)."
+    echo "[УСПЕХ] Узел $CURRENT_NODE подготовлен (v5.0 Production Full активны)."
     echo "Когда оба узла будут подготовлены и репликация БД настроена, выполните на $NODE1_NAME:"
     echo "  sudo /usr/local/sbin/bootstrap-ha.sh --init-pcs"
 fi

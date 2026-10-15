@@ -14,11 +14,15 @@
 - **Балансировка и проверка роли**:
   - HAProxy слушает порт `127.0.0.1:5000`.
   - Порт проверки роли СУБД: `9200` (`db-role-check.socket` -> `/usr/local/bin/db-role-check.sh`).
-- **Службы приложения**: группа `app-stack` (`haproxy-svc`, `my-app`, `my-daemon`).
+- **Службы приложения**: разделены на критическое ядро `core-app-stack` (`haproxy-svc`, `my-app` в связке с `vip`) и второстепенный `daemon-svc` (`symmetrical=false`).
+- **Служебные ресурсы и агенты Pacemaker**:
+  - `fs-mon` (`ocf:heartbeat:Diskd`): защита раздела `/var/lib/pacemaker` от переполнения (порог 500 МБ).
+  - `ping-gateway` (`ocf:pacemaker:ping`): мониторинг шлюза роутера с положительным правилом `pingd gt 0`.
+  - `vip` (`ocf:heartbeat:IPaddr2`): с параметрами `run_arping=true arp_interval=500 arp_count=5`.
 - **Служебные скрипты и юниты**:
-  - `cluster-boot-analyzer.service` (`/usr/local/sbin/cluster-boot-analyzer.sh`)
-  - `cluster-shutdown-marker.service` (`/usr/local/sbin/cluster-mark-shutdown.sh`)
-  - `cluster-degraded-unblock.timer` / `.service` (`/usr/local/sbin/cluster-degraded-unblock.sh`)
+  - `cluster-boot-analyzer.service` (`/usr/local/sbin/cluster-boot-analyzer.sh`) — проверка дисков, CIB, MTU, .pgpass, WAL.
+  - `cluster-shutdown-marker.service` (`/usr/local/sbin/cluster-mark-shutdown.sh`) — фиксация роли при выключении.
+  - `cluster-degraded-unblock.timer` / `.service` (`/usr/local/sbin/cluster-degraded-unblock.sh`) — 4-ступенчатый сторож деградации.
 
 ---
 
@@ -34,6 +38,8 @@
 | 6 | [TC-06-Восстановление-Узла-Rejoin.md](./TC-06-Восстановление-Узла-Rejoin.md) | Восстановление и возврат узла в кластер | [ВосстановлениеПослеПаденияМастер.mmd](../mmd/ВосстановлениеПослеПаденияМастер.mmd) |
 | 7 | [TC-07-Аварийный-Старт-Одиночного-Узла-Деградация.md](./TC-07-Аварийный-Старт-Одиночного-Узла-Деградация.md) | Запуск одиночного узла в режиме деградации | [ВосстановлениеПослеПаденияМастерРезерв.mmd](../mmd/ВосстановлениеПослеПаденияМастерРезерв.mmd) |
 | 8 | [TC-08-Плановое-Выключение-Кластера.md](./TC-08-Плановое-Выключение-Кластера.md) | Плановое корректное выключение кластера | [ПлановоеВыключениеКластера.mmd](../mmd/ПлановоеВыключениеКластера.mmd) |
+| 9 | [TC-09-Авария-Postgres-ReadOnly-XID.md](./TC-09-Авария-Postgres-ReadOnly-XID.md) | Авария PostgreSQL (Read-Only / XID Wraparound) | [ОтказPostgresReadOnly.mmd](../mmd/ОтказPostgresReadOnly.mmd) |
+| 10 | [TC-10-Аномалии-Инфраструктуры-MTU-CIB-Disk.md](./TC-10-Аномалии-Инфраструктуры-MTU-CIB-Disk.md) | Черная дыра MTU, дефицит диска CIB и VM Stun | Защитные блоки скрипта `bootstrap-ha.sh` v5.0 |
 
 ---
 
