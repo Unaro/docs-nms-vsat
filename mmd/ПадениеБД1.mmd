@@ -1,0 +1,30 @@
+sequenceDiagram 
+
+    autonumber
+
+    box rgb(240,240,240) Сервер 1
+        participant App1 as App1 / Демоны
+        participant HAP1 as HAProxy1 (:5000)
+        participant DB1 as PostgreSQL 1 (:5432)
+        participant PCM1 as Pacemaker1
+    end 
+ 
+    box rgb(240,240,240) Сервер 2
+        participant DB2 as PostgreSQL 2 (:5432)
+        participant PCM2 as Pacemaker2
+    end
+
+    DB1-xDB1: Авария Posgres
+    PCM1->>DB1: Ошибка проверки
+    PCM1->>PCM2: Сигнал аварии DB1 по интерконнекту
+    PCM2->>DB2: Команда PROMOTE (pg_ctl promote)
+    DB2->>DB2: Переход в Master
+
+    HAP1->>DB1: Проверка порта 8008 -> FAIL (DOWN)
+    HAP1->>DB2: Проверка порта 8008 по прямому линку -> HTTP 200 (UP)
+
+
+    App1->>HAP1: Новый SQL запрос на :5000
+    HAP1->>DB2: Отправка по прямому линку
+    DB2-->>HAP1: Фиксация транзакции
+    HAP1-->>App1: Ответ приложению

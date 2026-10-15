@@ -1,0 +1,41 @@
+sequenceDiagram 
+
+    autonumber
+
+    actor Ops as Оператор
+    participant Eltex as Маршрутизатор Eltex
+ 
+    box rgb(240,240,240) Сервер 1
+        participant VIP1 as VIP (10.1.3.5)
+        participant App1 as App1 / Демоны
+        participant DB1 as PostgreSQL 1 (:5432)
+        participant PCM1 as Pacemaker1
+    end 
+ 
+    box rgb(240,240,240) Сервер 2
+        participant VIP2 as VIP (10.1.3.5)
+        participant App2 as App2 / Демоны
+        participant HAP2 as HAProxy2 (:5000)
+        participant DB2 as PostgreSQL 2 (:5432)
+        participant PCM2 as Pacemaker2
+    end
+
+    App1-xApp1: Зависание воркеров / утечка дескрипторов
+    PCM1->>App1: Сервис недоступен
+    PCM1->>App1: Принудительная остановка Net-Daemons 1
+    PCM1->>VIP1: Снятие VIP 10.1.3.4
+    PCM1->>PCM2: Запрос миграции App-Group
+    
+    PCM2->>VIP2: Подъем VIP 10.1.3.4
+    VIP2->>Eltex: Отправка GARP
+    Eltex->>Eltex: VIP теперь на Сервере 2
+    PCM2->>App2: Запуск App2 и Net-Daemons 2
+
+    Ops->>Eltex: Запрос оператора к VIP 10.1.3.4
+    Eltex->>VIP2: Форвардинг
+    VIP2->>App2: Обработка запроса
+    App2->>HAP2: SQL Запрос на :5000
+    HAP2->>DB1: Маршрутизация по прямомоу линку к текущему Master
+    DB1-->>HAP2: Ответ транзакции
+    HAP2-->>App2: Данные переданы бэку
+    DB1--)DB2: Репликация WAL (Прямой линк 10.10.5.14/30)

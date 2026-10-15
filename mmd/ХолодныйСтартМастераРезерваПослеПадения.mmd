@@ -1,0 +1,63 @@
+sequenceDiagram
+    autonumber
+
+    actor Eng as Инженер
+    participant Eltex as Маршрутизатор Eltex
+
+
+    box rgb(240,240,240) Сервер 1
+        participant OS1 as OS / systemd 
+        participant CS1 as Corosync 1
+        participant DB1 as PostgreSQL 1 (:5432)
+        participant PCM1 as Pacemaker1
+    end 
+ 
+    box rgb(240,240,240) Сервер 2
+        participant OS2 as OS / systemd 
+        participant CS2 as Corosync 2
+        participant App2 as VIP / App2 / Демоны
+        participant DB2 as PostgreSQL 2 (:5432)
+        participant PCM2 as Pacemaker2
+    end
+
+    Eng->>Eltex: Подача питания на стойку / Старт Eltex
+    Eltex->>Eltex: Инициализация портов, подъем IP-шлюза
+
+
+    Eng->>OS1: Включение Сервера 1
+    OS1->>OS1: Старт сети eth0 (UP) и eth1 (UP)
+    OS1-->>CS1: systemd: автостарт corosync.service
+    OS1-->>PCM1: systemd: автостарт pacemaker.service
+    CS1->>CS1: Проверка: wait_for_all=1
+    CS1-->>PCM1: Заблокирован (Нет кворума)
+    note over CS1, PCM1: Pacemaker ждет старта ресурсов и промоутинг запрещен
+
+
+    Eng->>OS2: Включение Сервера 2
+    OS2->>OS2: Старт сети eth0 (UP) и eth1 (UP)
+    OS2-->>CS2: systemd: автостарт corosync.service
+    OS2-->>PCM2: systemd: автостарт pacemaker.service
+    CS1-->CS2: Handshake
+    CS1->>PCM1: Условие wait_for_all выполено -> кворум получен
+    CS2->>PCM2: Условие wait_for_all выполено -> кворум получен
+
+
+    PCM1->>DB1: OCF Probe: Чтение pg_controldata 
+    DB1-->>PCM1: Текущий LSN: 0/1A00450
+    PCM2->>DB2: OCF Probe: Чтение pg_controldata 
+    DB2-->>PCM2: Текущий LSN: 0/1B00890
+
+    PCM1-->PCM2: Обмен атрибутами master-scores
+    note over PCM1, PCM2: Сервер 2 получает master-score = 1000, Сервер 1 получается master-score = 100 
+
+
+    PCM2->>DB2: Команда PROMOTE (pg_ctl promote)
+    DB2->>DB2: Переход в Master (RW)
+    PCM2->>App2: Запуск группы: VIP + App 2 + Net-Daemons 2
+    App2->>Eltex: Отправка GARP
+    Eltex->>Eltex: VIP -> Сервер 2
+
+
+    PCM1->>DB1: Запуск базы в роли Standby
+    DB1--)DB2: Подключение потоковой репликации WAL к BD2
+    DB2-->>DB1: Поток WAL streaming активен

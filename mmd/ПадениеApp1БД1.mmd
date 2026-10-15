@@ -1,0 +1,62 @@
+
+sequenceDiagram 
+
+    autonumber
+
+    actor Ops as Оператор
+    participant Eltex as Маршрутизатор Eltex
+    participant Dev as Сетевое устройство
+
+    box rgb(240,240,240) Сервер 1
+        participant VIP1 as VIP (10.1.3.5)
+        participant App1 as App1 / Демоны
+        participant HAP1 as HAProxy1 (:5000)
+        participant DB1 as PostgreSQL 1 (:5432)
+        participant PCM1 as Pacemaker1
+    end 
+ 
+    box rgb(240,240,240) Сервер 2
+        participant VIP2 as VIP (10.1.3.5)
+        participant App2 as App2 / Демоны
+        participant HAP2 as HAProxy2 (:5000)
+        participant DB2 as PostgreSQL 2 (:5432)
+        participant PCM2 as Pacemaker2
+    end
+
+    DB2-xDB2: Сбой DB2 
+    PCM2->>DB2: Фиксация ошибки процесса
+    PCM2->>PCM1: Статус: DB2 в состоянии FAILED
+
+    App1-xApp1: Сбой App1
+    PCM1->>App1: Обнаружено падение приложения
+    PCM1->>VIP1: Снятие VIP 10.1.3.5
+    PCM1->>PCM2: Запрос на запуск App-Group
+
+
+    PCM2->>VIP2: Подъем VIP 10.1.3.5
+    VIP2->>Eltex: Отправка GARP
+    Eltex->>Eltex: VIP переключен на Сервер 2
+    PCM2->>App2: Запуск App 2
+    PCM2->>App2: Запуск Net-Daemons 2
+
+    Ops->>Eltex: Трафик операторов к VIP
+    Eltex->>VIP2: Маршрутизация на порт
+    VIP2->>App2: Обработка клиентских запросов
+
+    App2->>HAP2: SQL-запрос на :5000
+    HAP2->>DB2: Хелсчек -> DOWN
+    HAP2->>DB1: Хелсчек -> UP
+
+    HAP2->>DB1: SQL-запрос по прямому линку
+    DB1-->>HAP2: Успешная транзакция
+    HAP2-->>App2: Ответ бэку
+    App2-->>Ops: Ответ оператору / HTTP 200 OK
+
+    App2->>Eltex: Net-Daemons 2: Опросы и команды оборудованию
+    Eltex->>Dev: Доставка команд в сеть
+    Dev-->>Eltex: Ответ оборудования
+    Eltex-->>App2: Телеметрия получена
+    App2->>HAP2: Запись метрик в :5000
+    HAP2->>DB1: Отправка метрик
+    DB1-->>HAP2: Ответ транзакции
+    HAP2-->>App2: Данные переданы бэку

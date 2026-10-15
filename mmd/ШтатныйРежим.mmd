@@ -1,0 +1,32 @@
+sequenceDiagram 
+
+    autonumber
+
+    actor Ops as Оператор
+    participant Eltex as Маршрутизатор Eltex
+    participant Dev as Сетевое устройство
+
+    box rgb(240,240,240) Сервер 1
+        participant VIP1 as VIP (10.1.3.5)
+        participant App1 as App1 / Демоны
+        participant HAP1 as HAProxy1 (:5000)
+        participant DB1 as PostgreSQL 1 (:5432)
+    end 
+ 
+    box rgb(240,240,240) Сервер 2
+        participant DB2 as PostgreSQL 2 (:5432)
+    end
+
+    Ops->>Eltex: Трафик к 10.1.3.5
+    Eltex->>VIP1: Форвардинг
+    VIP1->>App1: Передача запроса в бэк
+    App1->>HAP1: SQL запрос на :5000
+    HAP1->>DB1: Маршрутизация на локальный Master(RW)
+    DB1-->>HAP1: Результат транзакции
+    HAP1-->>App1: Ответ клиенту
+    App1-->>Ops: HTTP 200 OK
+
+    App1->>Eltex: команды SSH / SNMP / NETCONF
+    Eltex->>Dev: Доставка конфига
+
+    DB1--)DB2: Репликация WAL (Прямой линк 10.10.5.14/30)

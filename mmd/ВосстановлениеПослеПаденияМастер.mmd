@@ -1,0 +1,42 @@
+sequenceDiagram
+    autonumber
+
+    actor Eng as Инженер
+
+    box rgb(240,240,240) Сервер 1 
+        participant OS1 as OC / Сервер 1
+        participant PCM1 as Pacemaker 1
+        participant DB1 as PostgreSQL 1
+        participant HAP1 as HAProxy 1 (:5000)
+    end
+
+
+    box rgb(240,240,240) Сервер 2 / Мастер
+        participant PCM2 as Pacemaker 2
+        participant DB2 as PostgreSQL 2
+    end
+
+    Eng->>OS1: Включиение питания / Загрузка OC
+    OS1->>OS1: Старт сети: eth0 (UP) и eth1 (UP)
+    OS1->>PCM1: Автостарт corosync & pacemaker.service
+    PCM1-->PCM2: Corosync: согласование членства (Rejoin)
+    PCM2-->>PCM1: Статус кластера: Сервер 2 Master DB и App-Group
+
+
+    PCM1->>PCM1: Проверка состояния DB1 перед стартом
+    alt Требуется откат таймлайна 
+        PCM1->>DB2: Запрос состояния WAL по прямому линку
+        PCM1->>DB1: Выполнение pg_rewind от Master
+        DB1-->>PCM1: Таймлайн согласован, создание standby.signal
+    end
+
+
+    PCM1->>DB1: Запуск службы PostgreSQL в роли Standby
+    DB1--)DB2: Подключение потоковой репликации WAL 
+    DB2-->>DB1: Поток WAL streaming активен 
+    PCM1->>PCM2: DB1 успешно запущена как Slave
+
+
+    OS1->>HAP1: Старт HAProxy на 127.0.0.1:5000
+    HAP1->>DB1: Опрос порта 8008 -> 503 (Standby)
+    HAP1->>DB2: Опрос порта 8008 -> 200 OK (Master)
