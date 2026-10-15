@@ -1,30 +1,69 @@
 sequenceDiagram 
-
     autonumber
 
-    box rgb(240,240,240) Сервер 1
-        participant App1 as App1 / Демоны
-        participant HAP1 as HAProxy1 (:5000)
+    actor Ops as Оператор / Клиент NMS
+    participant Eltex as Маршрутизатор Eltex (192.168.1.1)
+
+    box rgb(240,240,240) Сервер 1 (node1)
+        participant VIP1 as VIP (192.168.1.100)
+        participant App1 as App / my-daemon 1
+        participant HAP1 as HAProxy 1 (:5000)
+        participant SOK1 as db-role-check 1 (:9200)
         participant DB1 as PostgreSQL 1 (:5432)
-        participant PCM1 as Pacemaker1
+        participant PCM1 as Pacemaker 1
     end 
  
-    box rgb(240,240,240) Сервер 2
+    box rgb(240,240,240) Сервер 2 (node2)
+        participant PCM2 as Pacemaker 2
         participant DB2 as PostgreSQL 2 (:5432)
-        participant PCM2 as Pacemaker2
+        participant SOK2 as db-role-check 2 (:9200)
+        participant HAP2 as HAProxy 2 (:5000)
+        participant App2 as App / my-daemon 2
+        participant VIP2 as VIP (192.168.1.100)
     end
 
-    DB1-xDB1: Авария Posgres
-    PCM1->>DB1: Ошибка проверки
-    PCM1->>PCM2: Сигнал аварии DB1 по интерконнекту
-    PCM2->>DB2: Команда PROMOTE (pg_ctl promote)
-    DB2->>DB2: Переход в Master
+    Note over DB1: Авария процесса PostgreSQL на node1 (crash / OOM / I/O error)
+    DB1-xDB1: Сбой СУБД
 
-    HAP1->>DB1: Проверка порта 8008 -> FAIL (DOWN)
-    HAP1->>DB2: Проверка порта 8008 по прямому линку -> HTTP 200 (UP)
+    par Реакция сокета проверки и HAProxy1
+        HAP1->>SOK1: GET / на :9200 (интервал 2с)
+        SOK1--xHAP1: Ошибка подключения (Connection refused / DB unavailable)
+        Note over HAP1: Опция on-marked-down shutdown-sessions:<br/>HAProxy1 немедленно разрывает клиентские TCP-сессии
+    and Обнаружение сбоя кластером Pacemaker
+        PCM1->>DB1: Мониторинг ocf:heartbeat:pgsqlms (интервал 15s) FAIL
+        PCM1->>PCM2: Уведомление по Corosync (Ring0/Ring1): DB1 FAILED
+    end
 
+    Note over PCM1, PCM2: Принятие решения о переключении (Failover)
+    PCM1->>DB1: pgsql demote / stop (демоутинг старого мастера)
+    PCM2->>DB2: pgsql promote (ocf:heartbeat:pgsqlms)
+    DB2->>DB2: pg_ctl promote (переход в статус Master RW)
 
-    App1->>HAP1: Новый SQL запрос на :5000
-    HAP1->>DB2: Отправка по прямому линку
-    DB2-->>HAP1: Фиксация транзакции
-    HAP1-->>App1: Ответ приложению
+    Note over PCM2: Colocation constraints:<br/>vip with master pgsql-clone (500)<br/>app-stack with vip (INFINITY)<br/>Order: start vip then start app-stack
+    PCM1->>VIP1: Снятие VIP (192.168.1.100)
+    PCM1->>App1: Остановка app-stack (app-svc, daemon-svc, haproxy)
+    
+    PCM2->>VIP2: Подъем VIP (192.168.1.100 на eth0)
+    VIP2->>Eltex: Рассылка Gratuitous ARP (GARP)
+    Eltex->>Eltex: Обновление ARP-таблицы (VIP на MAC node2)
+
+    PCM2->>HAP2: Запуск haproxy-svc
+    PCM2->>App2: Запуск app-svc (my-app) и daemon-svc (my-daemon)
+
+    loop Healthcheck HAProxy2 (:9200)
+        HAP2->>SOK2: GET / на 127.0.0.1:9200
+        SOK2->>DB2: psql SELECT pg_is_in_recovery()
+        DB2-->>SOK2: Ответ f (Master)
+        SOK2-->>HAP2: HTTP/1.1 200 OK Master (node2_db UP)
+        HAP2->>SOK1: GET / на 10.0.0.1:9200 (Connection refused DOWN)
+    end
+
+    Ops->>Eltex: Запросы к VIP (192.168.1.100)
+    Eltex->>VIP2: Доставка трафика на Сервер 2
+    VIP2->>App2: Обработка запросов на бэкенде node2
+    App2->>HAP2: SQL-запросы на 127.0.0.1:5000
+    HAP2->>DB2: Маршрутизация на локальный Master (:5432)
+    DB2-->>HAP2: Фиксация транзакций
+    HAP2-->>App2: Ответ приложению
+    App2-->>Ops: HTTP 200 OK
+    Note over DB2: Система работает в деградированном режиме<br/>(Master без Standby реплики)

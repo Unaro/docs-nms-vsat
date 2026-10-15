@@ -1,62 +1,71 @@
-
 sequenceDiagram 
-
     autonumber
 
-    actor Ops as Оператор
-    participant Eltex as Маршрутизатор Eltex
-    participant Dev as Сетевое устройство
+    actor Ops as Оператор / Клиент NMS
+    participant Eltex as Маршрутизатор Eltex (192.168.1.1)
+    participant Dev as Сетевое оборудование (VSAT)
 
-    box rgb(240,240,240) Сервер 1
-        participant VIP1 as VIP (10.1.3.5)
-        participant App1 as App1 / Демоны
-        participant HAP1 as HAProxy1 (:5000)
+    box rgb(240,240,240) Сервер 1 (node1)
+        participant VIP1 as VIP (192.168.1.100)
+        participant App1 as App / my-daemon 1
+        participant HAP1 as HAProxy 1 (:5000)
         participant DB1 as PostgreSQL 1 (:5432)
-        participant PCM1 as Pacemaker1
+        participant PCM1 as Pacemaker 1
     end 
  
-    box rgb(240,240,240) Сервер 2
-        participant VIP2 as VIP (10.1.3.5)
-        participant App2 as App2 / Демоны
-        participant HAP2 as HAProxy2 (:5000)
+    box rgb(240,240,240) Сервер 2 (node2)
+        participant PCM2 as Pacemaker 2
         participant DB2 as PostgreSQL 2 (:5432)
-        participant PCM2 as Pacemaker2
+        participant SOK2 as db-role-check 2 (:9200)
+        participant HAP2 as HAProxy 2 (:5000)
+        participant App2 as App / my-daemon 2
+        participant VIP2 as VIP (192.168.1.100)
     end
 
-    DB2-xDB2: Сбой DB2 
-    PCM2->>DB2: Фиксация ошибки процесса
-    PCM2->>PCM1: Статус: DB2 в состоянии FAILED
+    Note over VIP1, PCM1: Полный отказ Сервера 1 (Kernel Panic / Сбой электропитания / Сбой ОС)
+    PCM1-xPCM1: Узел 1 полностью недоступен (Node1 Crash)
 
-    App1-xApp1: Сбой App1
-    PCM1->>App1: Обнаружено падение приложения
-    PCM1->>VIP1: Снятие VIP 10.1.3.5
-    PCM1->>PCM2: Запрос на запуск App-Group
+    par Потеря межузловой связи Corosync
+        PCM2->>PCM1: Проверка Ring 0 (10.0.0.1) FAIL TIMEOUT
+        PCM2->>PCM1: Проверка Ring 1 (192.168.1.11) FAIL TIMEOUT
+    and Проверка внешнего сетевого арбитража
+        PCM2->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=100)
+    end
 
+    Note over PCM2: Сервер 2 подтверждает изоляцию Сервера 1 и наличие связи со шлюзом.<br/>Инициируется аварийный Failover на node2
+    PCM2->>DB2: Команда pgsql promote (ocf:heartbeat:pgsqlms)
+    DB2->>DB2: Процедура pg_ctl promote (Переход в Master RW)
 
-    PCM2->>VIP2: Подъем VIP 10.1.3.5
-    VIP2->>Eltex: Отправка GARP
-    Eltex->>Eltex: VIP переключен на Сервер 2
-    PCM2->>App2: Запуск App 2
-    PCM2->>App2: Запуск Net-Daemons 2
+    PCM2->>VIP2: Подъем VIP (192.168.1.100 на eth0) [colocation vip with master pgsql-clone]
+    VIP2->>Eltex: Отправка Gratuitous ARP (GARP)
+    Eltex->>Eltex: Переключение таблицы MAC-адресов на порт Сервера 2
 
-    Ops->>Eltex: Трафик операторов к VIP
-    Eltex->>VIP2: Маршрутизация на порт
-    VIP2->>App2: Обработка клиентских запросов
+    PCM2->>HAP2: Запуск haproxy-svc [order start vip then start app-stack]
+    PCM2->>App2: Запуск app-svc (my-app)
+    PCM2->>App2: Запуск daemon-svc (my-daemon)
 
-    App2->>HAP2: SQL-запрос на :5000
-    HAP2->>DB2: Хелсчек -> DOWN
-    HAP2->>DB1: Хелсчек -> UP
+    loop Healthcheck HAProxy2 (:9200)
+        HAP2->>SOK2: GET / на 127.0.0.1:9200
+        SOK2->>DB2: psql SELECT pg_is_in_recovery()
+        DB2-->>SOK2: Ответ f (Master)
+        SOK2-->>HAP2: HTTP/1.1 200 OK Master (node2_db UP)
+        HAP2->>DB1: Опрос 10.0.0.1:9200 (Host Unreachable node1_db DOWN)
+    end
 
-    HAP2->>DB1: SQL-запрос по прямому линку
-    DB1-->>HAP2: Успешная транзакция
-    HAP2-->>App2: Ответ бэку
-    App2-->>Ops: Ответ оператору / HTTP 200 OK
+    Ops->>Eltex: Запросы операторов NMS к VIP
+    Eltex->>VIP2: Маршрутизация на Сервер 2
+    VIP2->>App2: Обработка запросов клиентов
+    App2->>HAP2: SQL-запросы на 127.0.0.1:5000
+    HAP2->>DB2: Локальная доставка на Master (:5432)
+    DB2-->>HAP2: Фиксация транзакций
+    HAP2-->>App2: Ответ СУБД
+    App2-->>Ops: HTTP 200 OK
 
-    App2->>Eltex: Net-Daemons 2: Опросы и команды оборудованию
+    App2->>Eltex: my-daemon 2: Возобновление опроса и управления VSAT
     Eltex->>Dev: Доставка команд в сеть
-    Dev-->>Eltex: Ответ оборудования
+    Dev-->>Eltex: Возврат телеметрии
     Eltex-->>App2: Телеметрия получена
-    App2->>HAP2: Запись метрик в :5000
-    HAP2->>DB1: Отправка метрик
-    DB1-->>HAP2: Ответ транзакции
-    HAP2-->>App2: Данные переданы бэку
+    App2->>HAP2: Сохранение метрик через HAProxy (:5000)
+    HAP2->>DB2: Запись в БД2
+    DB2-->>HAP2: Подтверждение записи
+    Note over DB2: Работа в деградированном режиме: одиночная запись без Standby

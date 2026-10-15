@@ -1,32 +1,53 @@
 sequenceDiagram 
-
     autonumber
 
-    actor Ops as Оператор
-    participant Eltex as Маршрутизатор Eltex
-    participant Dev as Сетевое устройство
+    actor Ops as Оператор / Клиент NMS
+    participant Eltex as Маршрутизатор Eltex (192.168.1.1)
+    participant Dev as Сетевое оборудование (VSAT)
 
-    box rgb(240,240,240) Сервер 1
-        participant VIP1 as VIP (10.1.3.5)
-        participant App1 as App1 / Демоны
-        participant HAP1 as HAProxy1 (:5000)
-        participant DB1 as PostgreSQL 1 (:5432)
+    box rgb(240,240,240) Сервер 1 (node1 - Primary)
+        participant VIP as VIP (192.168.1.100)
+        participant App1 as App / my-daemon 1
+        participant HAP1 as HAProxy 1 (:5000)
+        participant SOK1 as db-role-check 1 (:9200)
+        participant DB1 as PostgreSQL 1 (:5432) Master
+        participant PCM1 as Pacemaker / Corosync 1
     end 
  
-    box rgb(240,240,240) Сервер 2
-        participant DB2 as PostgreSQL 2 (:5432)
+    box rgb(240,240,240) Сервер 2 (node2 - Standby)
+        participant PCM2 as Pacemaker / Corosync 2
+        participant SOK2 as db-role-check 2 (:9200)
+        participant DB2 as PostgreSQL 2 (:5432) Standby
     end
 
-    Ops->>Eltex: Трафик к 10.1.3.5
-    Eltex->>VIP1: Форвардинг
-    VIP1->>App1: Передача запроса в бэк
-    App1->>HAP1: SQL запрос на :5000
-    HAP1->>DB1: Маршрутизация на локальный Master(RW)
+    Note over PCM1, PCM2: Corosync knet: Ring 0 (10.0.0.x, prio 100) + Ring 1 (192.168.1.x, prio 50)<br/>Quorum 2/2 OK, no-quorum-policy=stop
+    PCM1->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=100)
+    PCM2->>Eltex: ping-gateway (ocf:pacemaker:ping к 192.168.1.1) OK (score=100)
+
+    loop Healthcheck каждые 2 сек (inter 2s)
+        HAP1->>SOK1: GET / на 127.0.0.1:9200 (systemd socket)
+        SOK1->>DB1: psql SELECT pg_is_in_recovery()
+        DB1-->>SOK1: f (Не в recovery = Master)
+        SOK1-->>HAP1: HTTP/1.1 200 OK Master (node1_db UP)
+
+        HAP1->>SOK2: GET / на 10.0.0.2:9200 (Ring 0)
+        SOK2->>DB2: psql SELECT pg_is_in_recovery()
+        DB2-->>SOK2: t (В recovery = Standby)
+        SOK2-->>HAP1: HTTP/1.1 503 Service Unavailable Slave
+    end
+
+    Ops->>Eltex: Трафик NMS к VIP (192.168.1.100)
+    Eltex->>VIP: Форвардинг пакетов (ARP указывает на eth0 node1)
+    VIP->>App1: Запрос клиента в бэкенд my-app
+    App1->>HAP1: SQL-запрос на 127.0.0.1:5000
+    HAP1->>DB1: Проксирование на локальный Master (:5432)
     DB1-->>HAP1: Результат транзакции
-    HAP1-->>App1: Ответ клиенту
-    App1-->>Ops: HTTP 200 OK
+    HAP1-->>App1: Ответ СУБД
+    App1-->>Ops: HTTP 200 OK (ответ оператору)
 
-    App1->>Eltex: команды SSH / SNMP / NETCONF
-    Eltex->>Dev: Доставка конфига
+    App1->>Eltex: Команды опроса и управления (SSH / SNMP / NETCONF)
+    Eltex->>Dev: Доставка команд на VSAT-терминалы
+    Dev-->>Eltex: Телеметрия и метрики
+    Eltex-->>App1: Возврат метрик демонам my-daemon
 
-    DB1--)DB2: Репликация WAL (Прямой линк 10.10.5.14/30)
+    DB1--)DB2: Потоковая репликация WAL (Ring 0: 10.0.0.1 на 10.0.0.2)

@@ -1,41 +1,65 @@
 sequenceDiagram 
-
     autonumber
 
-    actor Ops as Оператор
-    participant Eltex as Маршрутизатор Eltex
+    actor Ops as Оператор / Клиент NMS
+    participant Eltex as Маршрутизатор Eltex (192.168.1.1)
  
-    box rgb(240,240,240) Сервер 1
-        participant VIP1 as VIP (10.1.3.5)
-        participant App1 as App1 / Демоны
-        participant DB1 as PostgreSQL 1 (:5432)
-        participant PCM1 as Pacemaker1
+    box rgb(240,240,240) Сервер 1 (node1)
+        participant VIP1 as VIP (192.168.1.100)
+        participant App1 as App / my-daemon 1
+        participant HAP1 as HAProxy 1 (:5000)
+        participant SOK1 as db-role-check 1 (:9200)
+        participant DB1 as PostgreSQL 1 (:5432) Master
+        participant PCM1 as Pacemaker 1
     end 
  
-    box rgb(240,240,240) Сервер 2
-        participant VIP2 as VIP (10.1.3.5)
-        participant App2 as App2 / Демоны
-        participant HAP2 as HAProxy2 (:5000)
-        participant DB2 as PostgreSQL 2 (:5432)
-        participant PCM2 as Pacemaker2
+    box rgb(240,240,240) Сервер 2 (node2)
+        participant PCM2 as Pacemaker 2
+        participant DB2 as PostgreSQL 2 (:5432) Standby
+        participant SOK2 as db-role-check 2 (:9200)
+        participant HAP2 as HAProxy 2 (:5000)
+        participant App2 as App / my-daemon 2
+        participant VIP2 as VIP (192.168.1.100)
     end
 
-    App1-xApp1: Зависание воркеров / утечка дескрипторов
-    PCM1->>App1: Сервис недоступен
-    PCM1->>App1: Принудительная остановка Net-Daemons 1
-    PCM1->>VIP1: Снятие VIP 10.1.3.4
-    PCM1->>PCM2: Запрос миграции App-Group
-    
-    PCM2->>VIP2: Подъем VIP 10.1.3.4
-    VIP2->>Eltex: Отправка GARP
-    Eltex->>Eltex: VIP теперь на Сервере 2
-    PCM2->>App2: Запуск App2 и Net-Daemons 2
+    Note over App1: Сбой приложения my-app / утечка дескрипторов / крах my-daemon
+    App1-xApp1: Ошибка сервиса app-svc
 
-    Ops->>Eltex: Запрос оператора к VIP 10.1.3.4
-    Eltex->>VIP2: Форвардинг
-    VIP2->>App2: Обработка запроса
-    App2->>HAP2: SQL Запрос на :5000
-    HAP2->>DB1: Маршрутизация по прямомоу линку к текущему Master
-    DB1-->>HAP2: Ответ транзакции
-    HAP2-->>App2: Данные переданы бэку
-    DB1--)DB2: Репликация WAL (Прямой линк 10.10.5.14/30)
+    PCM1->>App1: Мониторинг systemd:my-app (интервал 10s) FAIL
+    Note over PCM1: Группа ресурсов app-stack (haproxy, app, daemon):<br/>Сбой одного компонента инициирует перезапуск / миграцию группы
+    PCM1->>App1: Остановка app-svc и daemon-svc на Сервере 1
+    PCM1->>HAP1: Остановка haproxy-svc на Сервере 1
+    PCM1->>VIP1: Снятие VIP (192.168.1.100) [Colocation app-stack with vip INFINITY]
+    
+    PCM1->>PCM2: Corosync: запрос миграции VIP и app-stack на node2
+
+    PCM2->>VIP2: Подъем VIP (192.168.1.100) на интерфейсе eth0
+    VIP2->>Eltex: Отправка Gratuitous ARP (GARP)
+    Eltex->>Eltex: Переключение маршрутизации VIP на MAC Сервера 2
+
+    PCM2->>HAP2: Запуск haproxy-svc на Сервере 2
+    PCM2->>App2: Запуск app-svc (my-app) и daemon-svc (my-daemon) на Сервере 2
+
+    Note over DB1, DB2: Роли СУБД НЕ менялись:<br/>DB1 остаётся Master, DB2 остаётся Standby
+
+    loop Healthcheck HAProxy2 (:9200)
+        HAP2->>SOK1: GET / на 10.0.0.1:9200 (Ring 0)
+        SOK1->>DB1: psql SELECT pg_is_in_recovery()
+        DB1-->>SOK1: Ответ f (Master)
+        SOK1-->>HAP2: HTTP/1.1 200 OK Master (node1_db UP)
+
+        HAP2->>SOK2: GET / на 127.0.0.1:9200
+        SOK2->>DB2: psql SELECT pg_is_in_recovery()
+        DB2-->>SOK2: Ответ t (Standby)
+        SOK2-->>HAP2: HTTP/1.1 503 Service Unavailable Slave (node2_db DOWN)
+    end
+
+    Ops->>Eltex: Запросы оператора к VIP 192.168.1.100
+    Eltex->>VIP2: Доставка трафика на Сервер 2
+    VIP2->>App2: Обработка запросов на бэкенде Сервера 2
+    App2->>HAP2: SQL-запрос на 127.0.0.1:5000
+    HAP2->>DB1: Маршрутизация по прямому линку Ring 0 (10.0.0.1:5432)
+    DB1-->>HAP2: Результат транзакции
+    HAP2-->>App2: Данные переданы приложению
+    App2-->>Ops: HTTP 200 OK
+    DB1--)DB2: Потоковая репликация WAL продолжается (Ring 0: 10.0.0.1 на 10.0.0.2)

@@ -2,41 +2,61 @@ sequenceDiagram
     autonumber
 
     actor Eng as Инженер
+    participant Eltex as Маршрутизатор Eltex (192.168.1.1)
 
-    box rgb(240,240,240) Сервер 1 
-        participant OS1 as OC / Сервер 1
+    box rgb(240,240,240) Сервер 1 (Восстанавливаемый узел node1)
+        participant OS1 as systemd
+        participant CBA1 as cluster-boot-analyzer.sh
+        participant CS1 as Corosync 1
         participant PCM1 as Pacemaker 1
-        participant DB1 as PostgreSQL 1
+        participant DB1 as PostgreSQL 1 (:5432)
+        participant SOK1 as db-role-check 1 (:9200)
         participant HAP1 as HAProxy 1 (:5000)
     end
 
-
-    box rgb(240,240,240) Сервер 2 / Мастер
+    box rgb(240,240,240) Сервер 2 (Действующий Master node2)
         participant PCM2 as Pacemaker 2
-        participant DB2 as PostgreSQL 2
+        participant DB2 as PostgreSQL 2 (:5432)
+        participant SOK2 as db-role-check 2 (:9200)
+        participant VIP2 as VIP (192.168.1.100)
     end
 
-    Eng->>OS1: Включиение питания / Загрузка OC
-    OS1->>OS1: Старт сети: eth0 (UP) и eth1 (UP)
-    OS1->>PCM1: Автостарт corosync & pacemaker.service
-    PCM1-->PCM2: Corosync: согласование членства (Rejoin)
-    PCM2-->>PCM1: Статус кластера: Сервер 2 Master DB и App-Group
+    Eng->>OS1: Включение питания / Загрузка ОС Сервера 1
+    OS1->>OS1: Подъем сети: Ring 0 (10.0.0.1) и Ring 1 (192.168.1.11)
+    
+    OS1->>CBA1: Запуск cluster-boot-analyzer.service
+    CBA1->>CBA1: Проверка FS (RW, >5% свободного места, PG_VERSION)
+    CBA1->>CBA1: Чтение pg_controldata (Режим CRASH_RECOVERY)
+    CBA1-->>OS1: Предстартовые проверки успешно пройдены
 
+    OS1->>CS1: systemd: запуск corosync.service
+    OS1->>PCM1: systemd: запуск pacemaker.service
 
-    PCM1->>PCM1: Проверка состояния DB1 перед стартом
-    alt Требуется откат таймлайна 
-        PCM1->>DB2: Запрос состояния WAL по прямому линку
-        PCM1->>DB1: Выполнение pg_rewind от Master
-        DB1-->>PCM1: Таймлайн согласован, создание standby.signal
+    CS1->>PCM2: Corosync knet: Rejoin по Ring 0 и Ring 1
+    PCM2-->>CS1: Подтверждение членства в кластере (Quorum 2/2)
+    Note over PCM1, PCM2: Кворум восстановлен (2/2 узла).<br/>Свойство resource-stickiness=100 предотвращает failback:<br/>Сервер 2 ОСТАЁТСЯ Master, VIP и app-stack остаются на Сервере 2
+
+    PCM1->>DB1: Предварительная проверка pgsqlms
+    alt Требуется откат расхождения WAL (Timeline divergence)
+        PCM1->>DB2: Сравнение LSN / pg_rewind от Master (Сервер 2)
+        DB2-->>PCM1: Передача недостающих WAL-файлов
+        PCM1->>DB1: Завершение отката, создание standby.signal
     end
-
 
     PCM1->>DB1: Запуск службы PostgreSQL в роли Standby
-    DB1--)DB2: Подключение потоковой репликации WAL 
-    DB2-->>DB1: Поток WAL streaming активен 
-    PCM1->>PCM2: DB1 успешно запущена как Slave
+    DB1--)DB2: Подключение потоковой репликации WAL (10.0.0.1 на 10.0.0.2)
+    DB2-->>DB1: Поток WAL streaming активен (Реплика синхронизирована)
+    PCM1->>PCM2: Статус: DB1 успешно запущена как Standby
 
+    OS1->>SOK1: systemd: запуск db-role-check.socket (:9200)
+    OS1->>HAP1: Готовность HAProxy (при необходимости старта)
 
-    OS1->>HAP1: Старт HAProxy на 127.0.0.1:5000
-    HAP1->>DB1: Опрос порта 8008 -> 503 (Standby)
-    HAP1->>DB2: Опрос порта 8008 -> 200 OK (Master)
+    loop Healthcheck сокета роли (:9200)
+        SOK1->>DB1: psql SELECT pg_is_in_recovery()
+        DB1-->>SOK1: Ответ t (Standby)
+        SOK1-->>SOK1: HTTP/1.1 503 Service Unavailable Slave
+        SOK2->>DB2: psql SELECT pg_is_in_recovery()
+        DB2-->>SOK2: Ответ f (Master)
+        SOK2-->>SOK2: HTTP/1.1 200 OK Master
+    end
+    Note over DB1, DB2: Кластер вернулся в полностью избыточный режим HA (Master + Standby)

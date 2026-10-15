@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+
+    actor Ops as Администратор / Оператор
+    participant OS as systemd (Сервер 1 / Сервер 2)
+    participant CSM as cluster-shutdown-marker.service
+    participant CMS as cluster-mark-shutdown.sh
+    participant PCM as Pacemaker / Corosync
+    participant DB as PostgreSQL 16
+    participant Disk as /var/lib/cluster-state/graceful_shutdown
+
+    Ops->>OS: Инициализация планового выключения (systemctl poweroff / reboot)
+    Note over OS: systemd начинает остановку сервисов согласно зависимостям
+
+    OS->>CSM: Остановка cluster-shutdown-marker.service (ExecStop)
+    Note over CSM: Сервис имеет Requires=pacemaker.service и After=pacemaker.service,<br/>поэтому ExecStop срабатывает ДО остановки Pacemaker!
+
+    CSM->>CMS: Вызов /usr/local/sbin/cluster-mark-shutdown.sh
+    CMS->>PCM: Опрос роли: crm_mon -1 | grep Promoted
+    PCM-->>CMS: Текущая роль узла (Master или Slave)
+
+    CMS->>PCM: Опрос живых участников: crm_node -l | grep member
+    PCM-->>CMS: Количество участников (ONLINE_NODES_COUNT)
+
+    alt Узел является Master И остался единственным живым узлом (count == 1)
+        CMS->>CMS: FINAL_ROLE = "MASTER"
+        Note over CMS: Этот узел выключается последним из участников.<br/>Именно он владеет наиболее актуальным состоянием данных!
+    else Узел является Standby ИЛИ оба узла ещё онлайн (count > 1)
+        CMS->>CMS: FINAL_ROLE = "SLAVE"
+    end
+
+    CMS->>Disk: Запись маркера: SHUTDOWN_TYPE=GRACEFUL, LAST_KNOWN_ROLE=$FINAL_ROLE, TIMESTAMP
+    CMS->>Disk: Принудительный сброс буферов: sync
+    CMS->>OS: Запись в системный журнал: logger "Штатная остановка..."
+
+    OS->>PCM: Остановка pacemaker.service и corosync.service
+    PCM->>DB: Корректная остановка СУБД (pg_ctl stop -m fast)
+    DB-->>Disk: Запись чекпоинта: pg_controldata status -> "shut down"
+    OS->>OS: Завершение работы операционной системы (Power Off)
