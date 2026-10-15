@@ -6,7 +6,8 @@ sequenceDiagram
  
     box rgb(240,240,240) Сервер 1 (node1)
         participant VIP1 as VIP (192.168.1.100)
-        participant App1 as App / my-daemon 1
+        participant App1 as App (my-app) 1
+        participant Dmn1 as Демон (my-daemon) 1
         participant HAP1 as HAProxy 1 (:5000)
         participant SOK1 as db-role-check 1 (:9200)
         participant DB1 as PostgreSQL 1 (:5432) Master
@@ -18,27 +19,32 @@ sequenceDiagram
         participant DB2 as PostgreSQL 2 (:5432) Standby
         participant SOK2 as db-role-check 2 (:9200)
         participant HAP2 as HAProxy 2 (:5000)
-        participant App2 as App / my-daemon 2
+        participant App2 as App (my-app) 2
+        participant Dmn2 as Демон (my-daemon) 2
         participant VIP2 as VIP (192.168.1.100)
     end
 
-    Note over App1: Сбой приложения my-app / утечка дескрипторов / крах my-daemon
+    Note over App1, Dmn1: v4.0 Развязка Fate-Sharing:<br/>Критическое ядро core-app-stack (haproxy + my-app) отделено от daemon-svc!
+
+    Note over App1: Сбой основного приложения my-app
     App1-xApp1: Ошибка сервиса app-svc
 
     PCM1->>App1: Мониторинг systemd:my-app (интервал 10s) FAIL
-    Note over PCM1: Группа ресурсов app-stack (haproxy, app, daemon):<br/>Сбой одного компонента инициирует перезапуск / миграцию группы
-    PCM1->>App1: Остановка app-svc и daemon-svc на Сервере 1
+    Note over PCM1: Сбой в core-app-stack инициирует миграцию ядра и VIP на node2.<br/>(При падении же только my-daemon ядро core-app-stack не перезапускается!)
+    PCM1->>Dmn1: Остановка зависимого daemon-svc на Сервере 1
+    PCM1->>App1: Остановка app-svc на Сервере 1
     PCM1->>HAP1: Остановка haproxy-svc на Сервере 1
-    PCM1->>VIP1: Снятие VIP (192.168.1.100) [Colocation app-stack with vip INFINITY]
+    PCM1->>VIP1: Снятие VIP (192.168.1.100) [Colocation core-app-stack with vip INFINITY]
     
-    PCM1->>PCM2: Corosync: запрос миграции VIP и app-stack на node2
+    PCM1->>PCM2: Corosync: запрос миграции VIP и core-app-stack на node2
 
     PCM2->>VIP2: Подъем VIP (192.168.1.100) на интерфейсе eth0
     VIP2->>Eltex: Отправка Gratuitous ARP (GARP)
     Eltex->>Eltex: Переключение маршрутизации VIP на MAC Сервера 2
 
-    PCM2->>HAP2: Запуск haproxy-svc на Сервере 2
-    PCM2->>App2: Запуск app-svc (my-app) и daemon-svc (my-daemon) на Сервере 2
+    PCM2->>HAP2: Запуск haproxy-svc на Сервере 2 [группа core-app-stack]
+    PCM2->>App2: Запуск app-svc (my-app) на Сервере 2 [группа core-app-stack]
+    PCM2->>Dmn2: Запуск зависимого daemon-svc на Сервере 2 [order core-app-stack then daemon-svc]
 
     Note over DB1, DB2: Роли СУБД НЕ менялись:<br/>DB1 остаётся Master, DB2 остаётся Standby
 

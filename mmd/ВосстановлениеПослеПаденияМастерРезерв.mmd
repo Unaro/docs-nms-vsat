@@ -2,7 +2,7 @@ sequenceDiagram
     autonumber
 
     actor Eng as Инженер / Питание ЦОД
-    participant Eltex as Маршрутизатор Eltex (192.168.1.1)
+    participant Eltex as Маршрутизаторы (ROUTER_IPS)
 
     box rgb(240,240,240) Сервер 1 (Единственный оживший узел node1)
         participant OS1 as systemd
@@ -11,7 +11,7 @@ sequenceDiagram
         participant PCM1 as Pacemaker 1
         participant WDG as cluster-degraded-unblock.sh
         participant DB1 as PostgreSQL 1 (:5432)
-        participant App1 as VIP / app-stack 1
+        participant App1 as VIP / core-app-stack 1
     end
 
     box rgb(240,240,240) Сервер 2 (node2 - Недоступен / Разрушен)
@@ -26,8 +26,8 @@ sequenceDiagram
     OS1->>CBA: Запуск cluster-boot-analyzer.service (Before corosync/pacemaker)
     CBA->>CBA: Проверка ФС: PGDATA/PG_VERSION, RW-тест, свободное место (>=5%)
     CBA->>DB1: Чтение pg_controldata
-    DB1-->>CBA: Database cluster state: "in production" (или "shut down")
-    Note over CBA: Маркера graceful_shutdown нет -> Режим CRASH_RECOVERY<br/>Запись в /run/cluster_boot_mode (UNBLOCK_TIMEOUT_SEC=900)
+    DB1-->>CBA: Database cluster state: in production (или shut down)
+    Note over CBA: Маркера graceful_shutdown нет : Режим CRASH_RECOVERY<br/>Запись в /run/cluster_boot_mode (UNBLOCK_TIMEOUT_SEC=900)
     CBA-->>OS1: Предстартовые проверки успешны (exit 0)
 
     OS1->>CS1: Запуск corosync.service
@@ -36,28 +36,36 @@ sequenceDiagram
     PCM1-->>PCM1: Старт ресурсов заблокирован (no-quorum-policy=stop)
 
     OS1->>WDG: cluster-degraded-unblock.timer: старт через 5с после Pacemaker
-    Note over WDG: Скрипт cluster-degraded-unblock.sh:<br/>Ожидание соседа таймаут UNBLOCK_TIMEOUT_SEC (900 сек / 15 мин)
+    Note over WDG: Скрипт cluster-degraded-unblock.sh:<br/>Ожидание: BASE_WAIT (900с) + асимметричный сдвиг (node1=0с, node2=120с)
     
     WDG->>CS1: Проверка: corosync-quorumtool -s (появился ли кворум?)
     CS1-->>WDG: Quorate: No (сосед не появился)
 
-    Note over WDG: Срабатывание Предохранителя №1 (Сетевой арбитраж)
-    WDG->>Eltex: ping -c 3 ROUTER_IP (192.168.1.1)
-    Eltex-->>WDG: Ответ получен (Маршрутизатор доступен)
-    WDG->>Node2: ping соседа по Ring 0 (10.0.0.2) и Ring 1 (192.168.1.12)
-    Node2--xWDG: 100% packet loss (Сосед гарантированно молчит)
+    Note over WDG: Предохранитель 1 (v4.0): Комбинированная проверка шлюзов ROUTER_IPS
+    WDG->>Eltex: Вызов check_gateway_alive (L3 ICMP, L2 arping, ip neigh)
+    Eltex-->>WDG: Ответ получен (Шлюз доступен даже при закрытом ICMP!)
 
-    Note over WDG: Срабатывание Предохранителя №2 (Проверка роли до аварии)
-    alt Сценарий А: Узел до сбоя был MASTER (DB_RAW_STATE == "in production")
+    Note over WDG: Предохранитель 2: Проверка соседа по ICMP и TCP (9200, 5432, 22) на Ring 0 и Ring 1
+    WDG->>Node2: ping соседа по Ring 0 и Ring 1
+    Node2--xWDG: ICMP 100% loss (молчит)
+    WDG->>Node2: TCP timeout 2s на порты 9200, 5432, 22
+    Node2--xWDG: TCP Connection refused / timeout (Сосед гарантированно мертв)
+
+    Note over WDG: Предохранитель 3: Проверка активности CLUSTER_VIP в сети
+    WDG->>Eltex: ping CLUSTER_VIP и arping -D -I eth0 (192.168.1.100)
+    Eltex-->>WDG: VIP свободен в сети (конфликта и второго мастера нет)
+
+    Note over WDG: Предохранитель 4: Проверка роли СУБД перед аварией
+    alt Сценарий А: Узел до сбоя был MASTER (DB_RAW_STATE == in production)
         WDG->>PCM1: Выполнение команды: pcs quorum unblock --yes
         Note over PCM1: Кворум принудительно разблокирован для одиночного узла!
-        PCM1->>DB1: pgsqlms promote -> запуск БД в режиме Master (RW)
-        PCM1->>App1: Запуск VIP (192.168.1.100) и группы app-stack (haproxy, app, daemon)
+        PCM1->>DB1: pgsqlms promote (запуск БД в режиме Master RW)
+        PCM1->>App1: Запуск VIP (192.168.1.100), core-app-stack (haproxy, app) и daemon-svc
         App1->>Eltex: Отправка GARP в сеть
         Eltex->>Eltex: VIP переведен на Сервер 1
         Note over App1, DB1: Кластер успешно вышел в деградированный режим (Degraded Mode).<br/>Запись разрешена на единственном узле.
     else Сценарий Б: Узел до сбоя был РЕПЛИКОЙ (Standby)
-        WDG->>WDG: logger "СТОП! Этот узел до аварии был РЕПЛИКОЙ... Автопромоут запрещен!"
+        WDG->>WDG: logger СТОП: Этот узел до аварии был РЕПЛИКОЙ. Автопромоут запрещен!
         WDG-->>OS1: Аварийный останов скрипта (exit 1)
         Note over PCM1: Ресурсы остаются ЗАБЛОКИРОВАННЫМИ.<br/>Защита от Split-Brain и потери отставших данных.
     end

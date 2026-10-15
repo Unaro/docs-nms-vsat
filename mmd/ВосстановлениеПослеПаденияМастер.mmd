@@ -26,22 +26,30 @@ sequenceDiagram
     
     OS1->>CBA1: Запуск cluster-boot-analyzer.service
     CBA1->>CBA1: Проверка FS (RW, >5% свободного места, PG_VERSION)
-    CBA1->>CBA1: Чтение pg_controldata (Режим CRASH_RECOVERY)
+    CBA1->>CBA1: Контроль Chrony clock skew (makestep при необходимости)
+
+    Note over CBA1, DB2: v3.0: Проверка совместимости WAL и слота репликации
+    CBA1->>SOK2: HTTP-чек :9200 соседа (убеждаемся, что node2 - Master)
+    SOK2-->>CBA1: 200 OK Master
+
+    CBA1->>DB2: Запрос статуса слота slot_node1 и pg_rewind dry-run
+    alt Статус слота = lost ИЛИ pg_rewind невозможен (WAL удален)
+        CBA1->>CBA1: logger: ВНИМАНИЕ: Сегменты WAL удалены! Запуск авто-pg_basebackup
+        CBA1->>DB2: pg_basebackup -h 10.0.0.2 -U repl_user -R -S slot_node1
+        DB2-->>CBA1: Передача чистого снапшота базы данных
+        CBA1->>CBA1: Реплика успешно пересоздана с нуля!
+    else История совместима
+        CBA1->>CBA1: WAL сохранен, разрешен штатный запуск / rewind
+    end
+
     CBA1-->>OS1: Предстартовые проверки успешно пройдены
 
-    OS1->>CS1: systemd: запуск corosync.service
-    OS1->>PCM1: systemd: запуск pacemaker.service
+    OS1->>CS1: systemd: запуск corosync.service (RT SCHED_RR 99, OOM-1000)
+    OS1->>PCM1: systemd: запуск pacemaker.service (OOM-950)
 
     CS1->>PCM2: Corosync knet: Rejoin по Ring 0 и Ring 1
     PCM2-->>CS1: Подтверждение членства в кластере (Quorum 2/2)
     Note over PCM1, PCM2: Кворум восстановлен (2/2 узла).<br/>Свойство resource-stickiness=100 предотвращает failback:<br/>Сервер 2 ОСТАЁТСЯ Master, VIP и app-stack остаются на Сервере 2
-
-    PCM1->>DB1: Предварительная проверка pgsqlms
-    alt Требуется откат расхождения WAL (Timeline divergence)
-        PCM1->>DB2: Сравнение LSN / pg_rewind от Master (Сервер 2)
-        DB2-->>PCM1: Передача недостающих WAL-файлов
-        PCM1->>DB1: Завершение отката, создание standby.signal
-    end
 
     PCM1->>DB1: Запуск службы PostgreSQL в роли Standby
     DB1--)DB2: Подключение потоковой репликации WAL (10.0.0.1 на 10.0.0.2)
