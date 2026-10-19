@@ -72,9 +72,7 @@ CRASH_TIMEOUT_SEC="900"         # 15 минут ожидания соседа п
 NODE2_ASYMMETRIC_DELAY_SEC="120"# Сдвиг +2 мин на node2 против Split-Brain
 FAILURE_TIMEOUT_SEC="900s"      # 15 минут до сброса fail-count (против пинг-понга)
 
-# 7. Служебные файлы состояния и пароль кластера
-STATE_DIR="/var/lib/cluster-state"
-STATE_FILE="/var/lib/cluster-state/graceful_shutdown"
+# 7. Служебный файл режима загрузки и пароль кластера
 BOOT_MODE_FILE="/run/cluster_boot_mode"
 HACLUSTER_PASS="StrongClusterPass123!"
 EOF
@@ -111,9 +109,10 @@ COLD_START_TIMEOUT_SEC="${COLD_START_TIMEOUT_SEC:-180}"
 CRASH_TIMEOUT_SEC="${CRASH_TIMEOUT_SEC:-900}"
 NODE2_ASYMMETRIC_DELAY_SEC="${NODE2_ASYMMETRIC_DELAY_SEC:-120}"
 FAILURE_TIMEOUT_SEC="${FAILURE_TIMEOUT_SEC:-900s}"
+BOOT_MODE_FILE="${BOOT_MODE_FILE:-/run/cluster_boot_mode}"
 
 # -----------------------------------------------------------------------------
-# ШАГ 2. Автоопределение узла, настройка /etc/hosts, .pgpass и каталогов
+# ШАГ 2. Автоопределение узла, настройка /etc/hosts и .pgpass
 # -----------------------------------------------------------------------------
 LOCAL_IPS=$(hostname -I)
 if [[ " $LOCAL_IPS " == *" $NODE1_RING0_IP "* ]] || [[ " $LOCAL_IPS " == *" $NODE1_RING1_IP "* ]]; then
@@ -144,10 +143,7 @@ $NODE2_RING1_IP    ${NODE2_NAME}-ring1
 # --- HA-CLUSTER-HOSTS-END ---
 EOF
 
-mkdir -p "$STATE_DIR"
-chmod 700 "$STATE_DIR"
-
-# Создаем .pgpass с правами 0600 для беспарольной работы pg_rewind и pg_basebackup
+# Создаем .pgpass с правами 0600 для беспарольной работы репликации, pg_rewind и pg_basebackup
 mkdir -p "$(dirname "$PGPASS_FILE")"
 echo "*:${DB_PORT}:*:${REPL_USER}:${REPL_PASS}" > "$PGPASS_FILE"
 chown postgres:postgres "$PGPASS_FILE" 2>/dev/null || true
@@ -188,7 +184,6 @@ fi
 # Настройки в postgresql.conf, оптимизированные под нагрузку 30–60 устройств
 if [[ -f "${PGDATA}/postgresql.conf" ]]; then
     sed -i '/# --- HA-CLUSTER-PG-BEGIN ---/,/# --- HA-CLUSTER-PG-END ---/d' "${PGDATA}/postgresql.conf"
-    sed -i '/# --- HA-CLUSTER-PG-V5-BEGIN ---/,/# --- HA-CLUSTER-PG-V5-END ---/d' "${PGDATA}/postgresql.conf"
     cat << EOF >> "${PGDATA}/postgresql.conf"
 # --- HA-CLUSTER-PG-BEGIN ---
 listen_addresses = '*'
@@ -215,7 +210,7 @@ EOF
 fi
 
 # -----------------------------------------------------------------------------
-# ШАГ 4. Создание 4 рабочих скриптов кластера
+# ШАГ 4. Создание 3 рабочих скриптов кластера (без костыля graceful_shutdown)
 # -----------------------------------------------------------------------------
 echo "[INFO] Создаю рабочие скрипты кластера..."
 
@@ -224,7 +219,6 @@ cat << 'EOF' > /usr/local/bin/db-role-check.sh
 #!/bin/bash
 source /etc/default/ha-cluster
 
-# Жесткий таймаут 2с + statement_timeout 1.5с + проверка Read-Only через Unix-сокет суперпользователя
 SQL="SET statement_timeout='1500ms'; SELECT pg_is_in_recovery() || '|' || current_setting('transaction_read_only');"
 OUT=$(timeout 2 psql -p "${DB_PORT:-5432}" -U postgres -d postgres -tAc "$SQL" 2>/dev/null | tail -n 1 || echo "err")
 
@@ -238,31 +232,7 @@ fi
 EOF
 chmod +x /usr/local/bin/db-role-check.sh
 
-# 4.2 Скрипт фиксации штатного выключения (/usr/local/sbin/cluster-mark-shutdown.sh)
-cat << 'EOF' > /usr/local/sbin/cluster-mark-shutdown.sh
-#!/bin/bash
-source /etc/default/ha-cluster
-
-LOCAL_NODE=$(crm_node -n 2>/dev/null || hostname -s)
-
-# Если узел был Master перед началом остановки — фиксируем MASTER (защита при параллельном выключении)
-if crm_mon -1 2>/dev/null | grep -A 2 "Promoted:" | grep -qw "$LOCAL_NODE"; then
-    FINAL_ROLE="MASTER"
-elif [[ ! -f "${PGDATA}/standby.signal" ]] && pgrep -u postgres >/dev/null 2>&1; then
-    FINAL_ROLE="MASTER"
-else
-    FINAL_ROLE="SLAVE"
-fi
-
-echo "SHUTDOWN_TYPE=GRACEFUL" > "$STATE_FILE"
-echo "LAST_KNOWN_ROLE=$FINAL_ROLE" >> "$STATE_FILE"
-echo "TIMESTAMP=$(date +%s)" >> "$STATE_FILE"
-sync
-timeout 2 logger -t cluster-state "Штатная остановка ($LOCAL_NODE). Записана роль: $FINAL_ROLE" || true
-EOF
-chmod +x /usr/local/sbin/cluster-mark-shutdown.sh
-
-# 4.3 Предстартовый анализатор дисков и режима старта (/usr/local/sbin/cluster-boot-analyzer.sh)
+# 4.2 Предстартовый анализатор дисков и нативного состояния PostgreSQL (/usr/local/sbin/cluster-boot-analyzer.sh)
 cat << 'EOF' > /usr/local/sbin/cluster-boot-analyzer.sh
 #!/bin/bash
 set -euo pipefail
@@ -271,8 +241,6 @@ source /etc/default/ha-cluster
 log_msg() { timeout 2 logger -t cluster-precheck "$1" || true; }
 
 rm -f "$BOOT_MODE_FILE"
-WAS_GRACEFUL="no"
-SAVED_ROLE="UNKNOWN"
 
 # 1. Гарантируем корректные права на ключ Corosync и .pgpass
 if [[ -f /etc/corosync/authkey ]]; then
@@ -284,17 +252,7 @@ if [[ -f "$PGPASS_FILE" ]]; then
     chmod 0600 "$PGPASS_FILE"
 fi
 
-# 2. Читаем и МГНОВЕННО удаляем маркер штатного выключения с диска
-if [[ -f "$STATE_FILE" ]]; then
-    source "$STATE_FILE"
-    WAS_GRACEFUL="yes"
-    SAVED_ROLE="${LAST_KNOWN_ROLE:-UNKNOWN}"
-    rm -f "$STATE_FILE"
-    sync
-    log_msg "Маркер штатного выключения прочитан (Роль: $SAVED_ROLE) и удален."
-fi
-
-# 3. Проверка монтирования, записи (Read-Only), места (df) и индексных дескрипторов (df -i)
+# 2. Проверка монтирования, записи (Read-Only), места (df) и индексных дескрипторов (df -i)
 if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
     log_msg "КРИТИЧЕСКАЯ ОШИБКА: Каталог БД ($PGDATA) отсутствует! Старт кластера заблокирован."
     exit 1
@@ -318,7 +276,7 @@ if (( ${CIB_FREE_MB:-1000} < ${MIN_FREE_CIB_MB:-500} )); then
     journalctl --vacuum-size=100M >/dev/null 2>&1 || true
 fi
 
-# 4. Если сосед уже работает как Master, а наш слот WAL утерян (lost) — делаем авто-pg_basebackup
+# 3. Если сосед уже работает как Master, а наш слот WAL утерян (lost) — делаем авто-pg_basebackup
 LOCAL_IPS=$(hostname -I)
 if [[ " $LOCAL_IPS " == *" $NODE1_RING0_IP "* ]] || [[ " $LOCAL_IPS " == *" $NODE1_RING1_IP "* ]]; then
     PEER_IP="$NODE2_RING0_IP"
@@ -343,24 +301,32 @@ if curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://${PEER_IP}
     fi
 fi
 
-# 5. Запись сценария запуска (COLD_START или CRASH_RECOVERY)
+# 4. Определение режима старта и роли напрямую из pg_controldata и standby.signal
 DB_STATE=$(LC_ALL=C "$PGBIN/pg_controldata" "$PGDATA" 2>/dev/null | awk -F: '/Database cluster state/ {gsub(/^[ \t]+/, "", $2); print $2}')
 
-if [[ "$WAS_GRACEFUL" == "yes" ]] && [[ "$DB_STATE" == "shut down"* ]]; then
+if [[ -f "$PGDATA/standby.signal" ]] || [[ "$DB_STATE" == *"recovery"* ]]; then
+    DETECTED_ROLE="SLAVE"
+else
+    DETECTED_ROLE="MASTER"
+fi
+
+if [[ "$DB_STATE" == "shut down" ]] || [[ "$DB_STATE" == "shut down in recovery" ]]; then
     echo "MODE=COLD_START" > "$BOOT_MODE_FILE"
-    echo "LAST_ROLE=$SAVED_ROLE" >> "$BOOT_MODE_FILE"
+    echo "LAST_ROLE=$DETECTED_ROLE" >> "$BOOT_MODE_FILE"
+    echo "DB_RAW_STATE=${DB_STATE}" >> "$BOOT_MODE_FILE"
     echo "UNBLOCK_TIMEOUT_SEC=$COLD_START_TIMEOUT_SEC" >> "$BOOT_MODE_FILE"
-    log_msg "Диски исправны. СЦЕНАРИЙ: Плановый холодный старт (таймаут ${COLD_START_TIMEOUT_SEC}с)."
+    log_msg "Диски исправны. СЦЕНАРИЙ: Штатный холодный старт (БД: '$DB_STATE', Роль: $DETECTED_ROLE, таймаут ${COLD_START_TIMEOUT_SEC}с)."
 else
     echo "MODE=CRASH_RECOVERY" > "$BOOT_MODE_FILE"
+    echo "LAST_ROLE=$DETECTED_ROLE" >> "$BOOT_MODE_FILE"
     echo "DB_RAW_STATE=${DB_STATE:-UNKNOWN}" >> "$BOOT_MODE_FILE"
     echo "UNBLOCK_TIMEOUT_SEC=$CRASH_TIMEOUT_SEC" >> "$BOOT_MODE_FILE"
-    log_msg "Диски исправны. ВНИМАНИЕ: Старт после ПАДЕНИЯ (БД: '$DB_STATE', таймаут ${CRASH_TIMEOUT_SEC}с)."
+    log_msg "Диски исправны. ВНИМАНИЕ: Старт после СБОЯ ПИТАНИЯ (БД: '$DB_STATE', Роль: $DETECTED_ROLE, таймаут ${CRASH_TIMEOUT_SEC}с)."
 fi
 EOF
 chmod +x /usr/local/sbin/cluster-boot-analyzer.sh
 
-# 4.4 Сторож таймаута и выхода в режим деградации (/usr/local/sbin/cluster-degraded-unblock.sh)
+# 4.3 Сторож таймаута и выхода в режим деградации (/usr/local/sbin/cluster-degraded-unblock.sh)
 cat << 'EOF' > /usr/local/sbin/cluster-degraded-unblock.sh
 #!/bin/bash
 set -euo pipefail
@@ -381,7 +347,7 @@ else
 fi
 
 TOTAL_WAIT=$(( ${UNBLOCK_TIMEOUT_SEC:-$CRASH_TIMEOUT_SEC} + EXTRA_DELAY ))
-log_msg "Ожидание сбора кворума: ${TOTAL_WAIT} сек..."
+log_msg "Ожидание сбора кворума: ${TOTAL_WAIT} сек (Режим: ${MODE:-UNKNOWN}, Прошлая роль: ${LAST_ROLE:-UNKNOWN})..."
 sleep "$TOTAL_WAIT"
 
 if corosync-quorumtool -s 2>/dev/null | grep -q "Quorate:.*Yes"; then
@@ -422,15 +388,12 @@ if ping -c 2 -W 1 "$CLUSTER_VIP" >/dev/null 2>&1 || arping -D -I "$CLUSTER_VIP_N
     exit 1
 fi
 
-# Предохранитель №4: Разрешаем одиночный старт только бывшему Master
-if [[ "${MODE:-}" == "COLD_START" ]] && [[ "${LAST_ROLE:-}" == "MASTER" ]]; then
-    log_msg "Холодный старт в одиночку: разблокировка кворума (pcs quorum unblock)."
-    pcs quorum unblock --yes
-elif [[ "${MODE:-}" == "CRASH_RECOVERY" ]] && [[ "${DB_RAW_STATE:-}" == "in production" ]]; then
-    log_msg "АВАРИЙНЫЙ СТАРТ: Сосед не встал. Локальная БД была Master. Активация режима деградации!"
+# Предохранитель №4: Разрешаем одиночный старт только бывшему Master (по данным pg_controldata)
+if [[ "${LAST_ROLE:-}" == "MASTER" ]]; then
+    log_msg "Узел до остановки/сбоя был MASTER (MODE=${MODE:-}, DB=${DB_RAW_STATE:-}). Разблокировка кворума (pcs quorum unblock)!"
     pcs quorum unblock --yes
 else
-    log_msg "СТОП: Узел до выключения/аварии не был Master (MODE=${MODE:-}, ROLE=${LAST_ROLE:-}, DB=${DB_RAW_STATE:-})."
+    log_msg "СТОП: Узел до выключения/аварии был SLAVE (MODE=${MODE:-}, DB=${DB_RAW_STATE:-}). Одиночный старт запрещен во избежание потери данных."
     exit 1
 fi
 EOF
@@ -441,7 +404,7 @@ chmod +x /usr/local/sbin/cluster-degraded-unblock.sh
 # -----------------------------------------------------------------------------
 echo "[INFO] Настраиваю systemd-юниты и HAProxy (профиль: 30–60 устройств)..."
 
-# 5.1 Сокет и сервис проверки роли БД (без спама в journald и без риска зависания)
+# 5.1 Сокет и сервис проверки роли БД
 cat << EOF > /etc/systemd/system/db-role-check.socket
 [Unit]
 Description=PostgreSQL Role Check Socket for HAProxy
@@ -471,8 +434,8 @@ LogLevelMax=warning
 LimitNOFILE=65536
 EOF
 
-# 5.2 Конфигурация HAProxy (оптимизирована под 30–60 устройств: maxconn 300 / 100)
-cat << 'EOF' > /etc/haproxy/haproxy.cfg
+# 5.2 Конфигурация HAProxy (ИСПРАВЛЕНО: переменные подставляются при генерации файла)
+cat << EOF > /etc/haproxy/haproxy.cfg
 global
     log /dev/log local0 warning
     maxconn 300
@@ -492,20 +455,20 @@ defaults
     timeout check   2s
 
 listen postgres_master
-    bind "127.0.0.1:${HAPROXY_DB_BIND_PORT}"
+    bind 127.0.0.1:${HAPROXY_DB_BIND_PORT}
     mode tcp
     option httpchk GET /
     http-check expect status 200
     default-server inter 2s fall 2 rise 2 on-marked-down shutdown-sessions
     # Основные маршруты через прямой кабель (Ring 0)
-    server node1_db_r0 "${NODE1_RING0_IP}:${DB_PORT}" maxconn 100 check port "${DB_CHECK_PORT}"
-    server node2_db_r0 "${NODE2_RING0_IP}:${DB_PORT}" maxconn 100 check port "${DB_CHECK_PORT}"
+    server node1_db_r0 ${NODE1_RING0_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT}
+    server node2_db_r0 ${NODE2_RING0_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT}
     # Резервные маршруты через сеть роутера (Ring 1) на случай обрыва прямого кабеля
-    server node1_db_r1 "${NODE1_RING1_IP}:${DB_PORT}" maxconn 100 check port "${DB_CHECK_PORT}" backup
-    server node2_db_r1 "${NODE2_RING1_IP}:${DB_PORT}" maxconn 100 check port "${DB_CHECK_PORT}" backup
+    server node1_db_r1 ${NODE1_RING1_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT} backup
+    server node2_db_r1 ${NODE2_RING1_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT} backup
 EOF
 
-# 5.3 Юниты анализатора загрузки, маркера выключения и таймера деградации
+# 5.3 Юниты анализатора загрузки и таймера деградации (ИСПРАВЛЕНО: TimeoutStartSec=infinity)
 cat << EOF > /etc/systemd/system/cluster-boot-analyzer.service
 [Unit]
 Description=Pre-flight Disk Health Check and Boot Mode Analyzer for Pacemaker
@@ -517,29 +480,13 @@ Before=corosync.service pacemaker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=900
 EnvironmentFile=/etc/default/ha-cluster
 ExecStart=/usr/local/sbin/cluster-boot-analyzer.sh
 
 [Install]
 WantedBy=multi-user.target
 RequiredBy=corosync.service pacemaker.service
-EOF
-
-cat << 'EOF' > /etc/systemd/system/cluster-shutdown-marker.service
-[Unit]
-Description=Save cluster Master/Slave role before Pacemaker stops on graceful shutdown
-After=corosync.service pacemaker.service
-Requires=pacemaker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-EnvironmentFile=/etc/default/ha-cluster
-ExecStart=/bin/true
-ExecStop=/usr/local/sbin/cluster-mark-shutdown.sh
-
-[Install]
-WantedBy=multi-user.target
 EOF
 
 cat << 'EOF' > /etc/systemd/system/cluster-degraded-unblock.service
@@ -549,6 +496,7 @@ After=corosync.service pacemaker.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=infinity
 EnvironmentFile=/etc/default/ha-cluster
 ExecStart=/usr/local/sbin/cluster-degraded-unblock.sh
 EOF
@@ -565,6 +513,10 @@ Unit=cluster-degraded-unblock.service
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Удаляем старый юнит маркера выключения, если он остался от прошлой версии
+systemctl disable --now cluster-shutdown-marker.service 2>/dev/null || true
+rm -f /etc/systemd/system/cluster-shutdown-marker.service /usr/local/sbin/cluster-mark-shutdown.sh
 
 # 5.4 Защита от OOM-Killer, лимиты дескрипторов (LimitNOFILE) и RT-приоритет для Corosync
 mkdir -p /etc/systemd/system/corosync.service.d
@@ -620,7 +572,6 @@ done
 
 systemctl enable --now db-role-check.socket pcsd.service 2>/dev/null || true
 systemctl enable cluster-boot-analyzer.service \
-                 cluster-shutdown-marker.service \
                  cluster-degraded-unblock.timer 2>/dev/null || true
 
 echo "hacluster:${HACLUSTER_PASS}" | chpasswd 2>/dev/null || true
@@ -657,10 +608,10 @@ if [[ "${1:-}" == "--init-pcs" ]]; then
         host_list="$ROUTER_IPS" multiplier=1000 dampen=10s \
         op monitor interval=5s timeout=10s clone meta interleave=true
 
-    # СУБД PostgreSQL (агент PAF pgsqlms)
+    # СУБД PostgreSQL 16 (ИСПРАВЛЕНО: современный синтаксис PAF без recovery_template)
     pcs resource create pgsql ocf:heartbeat:pgsqlms \
-        bindir="$PGBIN" pgdata="$PGDATA" \
-        recovery_template="/var/lib/postgresql/recovery.conf.pcmk" \
+        bindir="$PGBIN" pgdata="$PGDATA" pghost="/var/run/postgresql" pgport="$DB_PORT" \
+        primary_conninfo_opt="user=${REPL_USER} passfile=${PGPASS_FILE} connect_timeout=5 keepalives_idle=15 keepalives_interval=5 keepalives_count=3" \
         op start timeout=60s op stop timeout=60s \
         op promote timeout=30s op demote timeout=120s \
         op monitor interval=15s timeout=10s role="Master" \
