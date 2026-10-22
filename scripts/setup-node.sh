@@ -19,10 +19,14 @@ case "${1:-}" in
   --standby)
     NODE_ROLE="STANDBY"
     ;;
+  --stop-master)
+    NODE_ROLE="STOP_MASTER"
+    ;;
   *)
     echo "[ОШИБКА] Укажите роль узла явно:"
-    echo "  sudo $0 --master   (запускается на node1)"
-    echo "  sudo $0 --standby  (запускается на node2)"
+    echo "  sudo $0 --master       (node1, инициализация и временный запуск master)"
+    echo "  sudo $0 --standby      (node2, pg_basebackup с node1)"
+    echo "  sudo $0 --stop-master  (node1, остановить временный master после standby)"
     exit 1
     ;;
 esac
@@ -37,6 +41,31 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 source "$ENV_FILE"
+
+if [[ "$NODE_ROLE" == "STOP_MASTER" ]]; then
+  echo "====================================================================="
+  echo " Остановка временного master на $(hostname)"
+  echo "====================================================================="
+
+  sudo -u postgres "$PGBIN/pg_ctl" \
+    -D "$PGDATA" \
+    stop -m fast -w -t 60 2>/dev/null || true
+
+  if sudo -u postgres "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; then
+    echo "[WARN] PostgreSQL всё ещё запущен, применяю immediate stop..."
+    sudo -u postgres "$PGBIN/pg_ctl" \
+      -D "$PGDATA" \
+      stop -m immediate -w -t 30 2>/dev/null || true
+  fi
+
+  if pgrep -u postgres -f "postgres -D $PGDATA" >/dev/null 2>&1; then
+    echo "[ОШИБКА] Не удалось остановить временный master."
+    exit 1
+  fi
+
+  echo "[УСПЕХ] Временный master остановлен."
+  exit 0
+fi
 
 echo "====================================================================="
 echo " Запуск настройки узла $(hostname) в роли: $NODE_ROLE"
@@ -75,23 +104,40 @@ chmod 0600 "$PGPASS_FILE"
 
 echo "hacluster:${HACLUSTER_PASS}" | chpasswd 2>/dev/null || true
 
-# 5. Скрипт проверки роли для балансировщика
+# 5. Скрипт проверки роли для балансировщика (с вычитыванием stdin и чистым ответом)
 cat << 'EOF' > /usr/local/bin/db-role-check.sh
 #!/bin/bash
+# 1. Вычитываем входящий HTTP-запрос из stdin для предотвращения TCP RST в HAProxy
+while read -r line; do
+  line=$(echo "$line" | tr -d '\r')
+  [[ -z "$line" ]] && break
+done
+
 DB_PORT="${DB_PORT:-5432}"
-SQL="SET statement_timeout='1500ms'; SELECT pg_is_in_recovery();"
-OUT=$(timeout 2 psql -p "$DB_PORT" -d postgres -tAc "$SQL" -X 2>/dev/null || echo "err")
+PGBIN="${PGBIN:-/usr/lib/postgresql/16/bin}"
+PSQL_CMD="$PGBIN/psql"
+if ! command -v "$PSQL_CMD" >/dev/null 2>&1; then
+  PSQL_CMD="psql"
+fi
+
+# 2. Таймаут через PGOPTIONS исключает паразитный вывод команды SET
+OUT=$(timeout 2 env PGOPTIONS="-c statement_timeout=1500ms" "$PSQL_CMD" \
+  -h /var/run/postgresql -p "$DB_PORT" -U postgres -d postgres -tAc \
+  "SELECT pg_is_in_recovery();" -X 2>/dev/null | tail -n 1 || echo "err")
 OUT=$(echo "$OUT" | tr -d '[:space:]')
 
 if [[ "$OUT" == "f" ]]; then
-  IS_RO=$(timeout 2 psql -p "$DB_PORT" -d postgres -tAc "SHOW transaction_read_only;" -X 2>/dev/null || echo "on")
+  IS_RO=$(timeout 2 env PGOPTIONS="-c statement_timeout=1500ms" "$PSQL_CMD" \
+    -h /var/run/postgresql -p "$DB_PORT" -U postgres -d postgres -tAc \
+    "SHOW transaction_read_only;" -X 2>/dev/null | tail -n 1 || echo "on")
   IS_RO=$(echo "$IS_RO" | tr -d '[:space:]')
   if [[ "$IS_RO" == "off" ]]; then
-    printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\nMaster"
+    printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\nMaster\r\n"
     exit 0
   fi
 fi
-printf "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nSlave"
+
+printf "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nSlave\r\n"
 exit 1
 EOF
 chmod +x /usr/local/bin/db-role-check.sh
@@ -114,6 +160,7 @@ Description=PostgreSQL Role Check Handler
 Requires=db-role-check.socket
 [Service]
 User=postgres
+Group=postgres
 EnvironmentFile=/etc/default/ha-cluster
 ExecStart=/usr/local/bin/db-role-check.sh
 StandardInput=socket
@@ -123,45 +170,54 @@ LogLevelMax=warning
 LimitNOFILE=65536
 EOF
 
-# 7. Конфигурация HAProxy (локальный порт HAPROXY_DB_BIND_PORT -> 5432)
+# 7. Конфигурация HAProxy
 cat << EOF > /etc/haproxy/haproxy.cfg
 global
-    log /dev/log local0 warning
-    maxconn 500
-    user haproxy
-    group haproxy
-    daemon
+  log /dev/log local0 warning
+  maxconn 500
+  user haproxy
+  group haproxy
+  daemon
 
 defaults
-    log     global
-    mode    tcp
-    option  tcplog
-    retries 3
-    timeout queue   1m
-    timeout connect 5s
-    timeout client  30m
-    timeout server  30m
-    timeout check   2s
+  log     global
+  mode    tcp
+  option  tcplog
+  retries 3
+  timeout queue   1m
+  timeout connect 5s
+  timeout client  30m
+  timeout server  30m
+  timeout check   2s
 
 listen postgres_master
-    bind 127.0.0.1:${HAPROXY_DB_BIND_PORT}
-    mode tcp
-    option httpchk GET /
-    http-check expect status 200
-    default-server inter 2s fall 2 rise 2 on-marked-down shutdown-sessions
+  bind 127.0.0.1:${HAPROXY_DB_BIND_PORT}
+  mode tcp
+  option httpchk GET /
+  http-check expect status 200
+  default-server inter 2s fall 2 rise 2 on-marked-down shutdown-sessions
 
-    server node1_db_r0 ${NODE1_RING0_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT}
-    server node2_db_r0 ${NODE2_RING0_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT}
-    server node1_db_r1 ${NODE1_RING1_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT} backup
-    server node2_db_r1 ${NODE2_RING1_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT} backup
+  server node1_db_r0 ${NODE1_RING0_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT}
+  server node2_db_r0 ${NODE2_RING0_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT}
+  server node1_db_r1 ${NODE1_RING1_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT} backup
+  server node2_db_r1 ${NODE2_RING1_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT} backup
 EOF
 
-# Функция записи кластерных директив в postgresql.conf и pg_hba.conf
+# Функция записи директив PostgreSQL
 configure_postgres_files() {
+  if [[ ! -f "${PGDATA}/postgresql.conf" || ! -f "${PGDATA}/pg_hba.conf" ]]; then
+    echo "[ОШИБКА] В PGDATA=${PGDATA} отсутствуют postgresql.conf или pg_hba.conf."
+    exit 1
+  fi
+
+  # Удаляем старые блоки параметров
   sed -i '/# --- HA-CLUSTER-PG-BEGIN ---/,/# --- HA-CLUSTER-PG-END ---/d' "${PGDATA}/postgresql.conf"
+  sed -i '/unix_socket_directories/d' "${PGDATA}/postgresql.conf"
+
   cat << EOF >> "${PGDATA}/postgresql.conf"
 # --- HA-CLUSTER-PG-BEGIN ---
 listen_addresses = '*'
+unix_socket_directories = '/var/run/postgresql, /tmp'
 max_connections = ${MAX_CONNECTIONS}
 shared_buffers = 256MB
 wal_level = replica
@@ -173,6 +229,7 @@ hot_standby_feedback = on
 superuser_reserved_connections = 3
 max_slot_wal_keep_size = ${MAX_SLOT_WAL_KEEP_SIZE}
 wal_keep_size = ${WAL_KEEP_SIZE}
+password_encryption = scram-sha-256
 idle_in_transaction_session_timeout = '15000ms'
 statement_timeout = '30000ms'
 lock_timeout = '5000ms'
@@ -182,66 +239,134 @@ tcp_keepalives_count = 3
 # --- HA-CLUSTER-PG-END ---
 EOF
 
-  sed -i '/# --- HA-REPLICATION-RULES ---/,/# --- HA-REPLICATION-END ---/d' "${PGDATA}/pg_hba.conf"
-  cat << EOF >> "${PGDATA}/pg_hba.conf"
+  # Полная чистая перезапись pg_hba.conf
+  cat << EOF > "${PGDATA}/pg_hba.conf"
 # --- HA-REPLICATION-RULES ---
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
-host    all             all             10.0.0.0/24             md5
-host    all             all             192.168.0.0/16          md5
-host    replication     ${REPL_USER}    127.0.0.1/32            md5
-host    replication     ${REPL_USER}    10.0.0.0/24             md5
-host    replication     ${REPL_USER}    192.168.0.0/16          md5
+host    all             all             ::1/128                 trust
+
+host    all             all             10.0.0.0/24             trust
+host    all             all             192.168.0.0/16          trust
+
+local   replication     all                                     trust
+host    replication     ${REPL_USER}    127.0.0.1/32            trust
+host    replication     ${REPL_USER}    ::1/128                 trust
+host    replication     ${REPL_USER}    10.0.0.0/24             trust
+host    replication     ${REPL_USER}    192.168.0.0/16          trust
 # --- HA-REPLICATION-END ---
 EOF
 }
 
-# 8. Ветвление подготовки базы по переданному флагу
+# Гарантируем права на каталог сокетов Unix
+mkdir -p /var/run/postgresql
+chown -R postgres:postgres /var/run/postgresql
+chmod 2775 /var/run/postgresql
+
+# Останавливаем системные демоны перед началом работ
 systemctl stop postgresql "postgresql@${PG_VERSION}-main" 2>/dev/null || true
 
+# 8. Ветвление подготовки базы по переданному флагу
 if [[ "$NODE_ROLE" == "MASTER" ]]; then
-  echo "--- [MASTER] Инициализация каталога PGDATA и создание ролей ---"
-  if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
+  echo "--- [MASTER] Инициализация каталога PGDATA и создание репликационной роли ---"
+
+  if [[ ! -f "$PGDATA/PG_VERSION" || ! -f "$PGDATA/postgresql.conf" || ! -f "$PGDATA/pg_hba.conf" ]]; then
+    echo "[INFO] Инициализирую PostgreSQL в каталоге: $PGDATA"
     mkdir -p "$(dirname "$PGDATA")"
     rm -rf "$PGDATA"
-    sudo -u postgres "$PGBIN/initdb" -D "$PGDATA" -k -E UTF8 --locale=C.UTF-8
+    mkdir -p "$PGDATA"
+    chown postgres:postgres "$PGDATA"
+    chmod 0700 "$PGDATA"
+
+    sudo -u postgres "$PGBIN/initdb" \
+      -D "$PGDATA" \
+      -k \
+      -E UTF8 \
+      --locale=C
+  else
+    echo "[INFO] Каталог $PGDATA уже инициализирован, обновляю параметры HA..."
   fi
 
   configure_postgres_files
 
-  # Запуск временного инстанса PostgreSQL для генерации слотов и ролей
-  sudo -u postgres "$PGBIN/pg_ctl" -D "$PGDATA" -o "-p $DB_PORT -c listen_addresses='*'" start -w -t 60
+  touch "$PGDATA/postgresql.auto.conf"
+  sed -i '/primary_conninfo/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
+  cat << EOF >> "$PGDATA/postgresql.auto.conf"
+primary_conninfo = 'host=${NODE2_RING0_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${NODE1_NAME}'
+EOF
+  chown postgres:postgres "$PGDATA/postgresql.auto.conf"
+  chmod 0600 "$PGDATA/postgresql.auto.conf"
 
-  sudo -u postgres "$PGBIN/psql" -p "$DB_PORT" -d postgres -c "
-  DO \$\$
-  BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${REPL_USER}') THEN
+  echo "[INFO] Запускаю временный master для создания репликации и slots..."
+  if ! sudo -u postgres "$PGBIN/pg_ctl" \
+    -D "$PGDATA" \
+    -l "$PGDATA/setup-master.log" \
+    -o "-p $DB_PORT -c listen_addresses='*'" \
+    start -w -t 60; then
+    echo "=== ОШИБКА ЗАПУСКА POSTGRESQL ==="
+    cat "$PGDATA/setup-master.log" 2>/dev/null || true
+    exit 1
+  fi
+
+  sudo -u postgres "$PGBIN/psql" -h /var/run/postgresql -p "$DB_PORT" -d postgres -v ON_ERROR_STOP=1 <<SQL
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${REPL_USER}') THEN
       CREATE ROLE ${REPL_USER} WITH REPLICATION LOGIN PASSWORD '${REPL_PASS}';
-    ELSE
+  ELSE
       ALTER ROLE ${REPL_USER} WITH REPLICATION LOGIN PASSWORD '${REPL_PASS}';
-    END IF;
-  END
-  \$\$;
-  GRANT pg_read_all_data TO ${REPL_USER};
-  SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE1}', true) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE1}');
-  SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE2}', true) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE2}');
-  "
+  END IF;
+END
+\$\$;
 
-  echo "[INFO] Мастер временно запущен на порту $DB_PORT для возможности снятия pg_basebackup нодой standby."
+GRANT pg_read_all_data TO ${REPL_USER};
+GRANT pg_read_server_files TO ${REPL_USER};
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) TO ${REPL_USER};
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text, bigint, bigint, boolean) TO ${REPL_USER};
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text, boolean) TO ${REPL_USER};
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_dir(text, boolean, boolean) TO ${REPL_USER};
+
+
+# SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE1}', true)
+# WHERE NOT EXISTS (
+#   SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE1}'
+# );
+
+# SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE2}', true)
+# WHERE NOT EXISTS (
+#   SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE2}'
+# );
+SQL
+
+  echo "[INFO] Временный master запущен и слушает порт $DB_PORT."
+  echo "[INFO] Теперь на node2 выполните:"
+  echo "       sudo $0 --standby"
+  echo "[INFO] После успешного standby вернитесь на node1 и выполните:"
+  echo "       sudo $0 --stop-master"
 
 elif [[ "$NODE_ROLE" == "STANDBY" ]]; then
   echo "--- [STANDBY] Клонирование базы данных с мастера ($NODE1_RING0_IP) ---"
-  
+
   TARGET_MASTER_IP="$NODE1_RING0_IP"
+
   echo "Проверка доступности порта $DB_PORT на мастере $TARGET_MASTER_IP..."
-  for i in {1..15}; do
+  MASTER_READY=0
+  for i in {1..30}; do
     if timeout 2 bash -c "</dev/tcp/${TARGET_MASTER_IP}/${DB_PORT}" 2>/dev/null; then
+      MASTER_READY=1
       break
     fi
-    echo "Попытка $i/15: порт $DB_PORT на $TARGET_MASTER_IP ещё недоступен, ждем..."
+    echo "Попытка $i/30: порт $DB_PORT на $TARGET_MASTER_IP ещё недоступен, ждем..."
     sleep 2
   done
 
+  if [[ "$MASTER_READY" -ne 1 ]]; then
+    echo "[ОШИБКА] Master $TARGET_MASTER_IP:$DB_PORT недоступен."
+    echo "Сначала запустите на node1: sudo $0 --master"
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "$PGDATA")"
   rm -rf "${PGDATA:?}"/*
   mkdir -p "$PGDATA"
   chown postgres:postgres "$PGDATA"
@@ -252,23 +377,47 @@ elif [[ "$NODE_ROLE" == "STANDBY" ]]; then
     -p "$DB_PORT" \
     -U "$REPL_USER" \
     -D "$PGDATA" \
-    -Fp -Xs -R \
+    -Fp -Xs -P -R \
     -S "$REPL_SLOT_NODE2"
 
-  touch "$PGDATA/standby.signal"
-  chown postgres:postgres "$PGDATA/standby.signal"
+  if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
+    echo "[ОШИБКА] После pg_basebackup отсутствует $PGDATA/PG_VERSION"
+    exit 1
+  fi
+
+  if [[ ! -f "$PGDATA/standby.signal" ]]; then
+    touch "$PGDATA/standby.signal"
+  fi
+
+  # Фиксируем application_name для Pacemaker/pgsqlms
+  touch "$PGDATA/postgresql.auto.conf"
+  sed -i '/primary_conninfo/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
+  cat << EOF >> "$PGDATA/postgresql.auto.conf"
+primary_conninfo = 'host=${TARGET_MASTER_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${NODE2_NAME}'
+EOF
 
   configure_postgres_files
+
+  chown -R postgres:postgres "$PGDATA"
+  chmod 0700 "$PGDATA"
+
+  echo "[УСПЕХ] Standby-каталог подготовлен на $(hostname)."
+  echo "[INFO] Выполните на node1: sudo $0 --stop-master"
 fi
 
-# 9. Фиксация служб в systemd: отключаем прямой автозапуск того, чем будет рулить Pacemaker
+# 9. Фиксация служб в systemd
 systemctl daemon-reload
+
+# Отключаем автозапуск системных сервисов (управление передается Pacemaker)
 for svc in postgresql "postgresql@${PG_VERSION}-main" haproxy; do
   systemctl disable "$svc" 2>/dev/null || true
-  systemctl stop "$svc" 2>/dev/null || true
+  if [[ "$NODE_ROLE" != "MASTER" ]]; then
+    systemctl stop "$svc" 2>/dev/null || true
+  fi
 done
 
-systemctl enable --now db-role-check.socket pcsd.service 2>/dev/null || true
+systemctl enable db-role-check.socket pcsd.service 2>/dev/null || true
+systemctl restart db-role-check.socket pcsd.service 2>/dev/null || true
 
 echo "====================================================================="
 echo "[УСПЕХ] Узел $(hostname) успешно настроен в роли $NODE_ROLE!"
