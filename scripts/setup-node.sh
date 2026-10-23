@@ -44,7 +44,7 @@ source "$ENV_FILE"
 
 if [[ "$NODE_ROLE" == "STOP_MASTER" ]]; then
   echo "====================================================================="
-  echo " Остановка временного master на $(hostname)"
+  echo " Остановка временного master на $(hostname) и подготовка для Pacemaker"
   echo "====================================================================="
 
   sudo -u postgres "$PGBIN/pg_ctl" \
@@ -63,7 +63,10 @@ if [[ "$NODE_ROLE" == "STOP_MASTER" ]]; then
     exit 1
   fi
 
-  echo "[УСПЕХ] Временный master остановлен."
+  touch "$PGDATA/standby.signal"
+  chown postgres:postgres "$PGDATA/standby.signal"
+
+  echo "[УСПЕХ] Временный master остановлен и переведен в готовность для Pacemaker."
   exit 0
 fi
 
@@ -226,6 +229,7 @@ full_page_writes = on
 track_commit_timestamp = on
 hot_standby = on
 hot_standby_feedback = on
+recovery_target_timeline = 'latest'
 superuser_reserved_connections = 3
 max_slot_wal_keep_size = ${MAX_SLOT_WAL_KEEP_SIZE}
 wal_keep_size = ${WAL_KEEP_SIZE}
@@ -290,9 +294,11 @@ if [[ "$NODE_ROLE" == "MASTER" ]]; then
   configure_postgres_files
 
   touch "$PGDATA/postgresql.auto.conf"
-  sed -i '/primary_conninfo/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
+  sed -i -E '/^(primary_conninfo|primary_slot_name|recovery_target_timeline)/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
   cat << EOF >> "$PGDATA/postgresql.auto.conf"
-primary_conninfo = 'host=${NODE2_RING0_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${NODE1_NAME}'
+primary_conninfo = 'host=${NODE2_RING0_IP},${NODE2_RING1_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${NODE1_NAME} connect_timeout=2 target_session_attrs=read-write'
+primary_slot_name = '${REPL_SLOT_NODE1}'
+recovery_target_timeline = 'latest'
 EOF
   chown postgres:postgres "$PGDATA/postgresql.auto.conf"
   chmod 0600 "$PGDATA/postgresql.auto.conf"
@@ -327,15 +333,15 @@ GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text, boolean) TO ${REPL_USER}
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_dir(text, boolean, boolean) TO ${REPL_USER};
 
 
-# SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE1}', true)
-# WHERE NOT EXISTS (
-#   SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE1}'
-# );
+SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE1}', true)
+WHERE NOT EXISTS (
+  SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE1}'
+);
 
-# SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE2}', true)
-# WHERE NOT EXISTS (
-#   SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE2}'
-# );
+SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE2}', true)
+WHERE NOT EXISTS (
+  SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE2}'
+);
 SQL
 
   echo "[INFO] Временный master запущен и слушает порт $DB_PORT."
@@ -389,11 +395,13 @@ elif [[ "$NODE_ROLE" == "STANDBY" ]]; then
     touch "$PGDATA/standby.signal"
   fi
 
-  # Фиксируем application_name для Pacemaker/pgsqlms
+  # Фиксируем подключение по двум кольцам, слот и application_name для Pacemaker/pgsqlms
   touch "$PGDATA/postgresql.auto.conf"
-  sed -i '/primary_conninfo/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
+  sed -i -E '/^(primary_conninfo|primary_slot_name|recovery_target_timeline)/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
   cat << EOF >> "$PGDATA/postgresql.auto.conf"
-primary_conninfo = 'host=${TARGET_MASTER_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${NODE2_NAME}'
+primary_conninfo = 'host=${NODE1_RING0_IP},${NODE1_RING1_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${NODE2_NAME} connect_timeout=2 target_session_attrs=read-write'
+primary_slot_name = '${REPL_SLOT_NODE2}'
+recovery_target_timeline = 'latest'
 EOF
 
   configure_postgres_files

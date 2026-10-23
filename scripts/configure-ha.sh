@@ -295,14 +295,19 @@ if [[ "$INITIAL_DB_STATE" == "unknown" ]]; then
   exit 1
 fi
 
+if [[ -f "$PGDATA/standby.signal" ]] || [[ "$INITIAL_DB_STATE" == *"recovery"* ]]; then
+  DETECTED_ROLE="SLAVE"
+else
+  DETECTED_ROLE="MASTER"
+fi
+
 # Если база не выключена чисто, выполняем recovery в строгой изоляции
 if [[ "$INITIAL_DB_STATE" != "shut down" && "$INITIAL_DB_STATE" != "shut down in recovery" ]]; then
   log_msg "База в аварийном состоянии ($INITIAL_DB_STATE). Запуск строго изолированного Crash Recovery..."
 
   set +e
-  # Изоляция: отключены архивация (archive_mode=off) и автовакуум во избежание порчи общего архива
   sudo -u postgres "$PGBIN/pg_ctl" -D "$PGDATA" \
-    -o "-c listen_addresses='' -c archive_mode=off -c autovacuum=off -c unix_socket_directories='/var/run/postgresql, /tmp'" \
+    -o "-c listen_addresses='' -c primary_conninfo='' -c archive_mode=off -c autovacuum=off -c unix_socket_directories='/var/run/postgresql, /tmp'" \
     start -w -t 90 >>"$SPLITBRAIN_LOG" 2>&1
   START_RC=$?
 
@@ -323,256 +328,18 @@ if [[ "$INITIAL_DB_STATE" != "shut down" && "$INITIAL_DB_STATE" != "shut down in
   fi
 fi
 
-# =============================================================================
-# 4. СИНХРОНИЗАЦИЯ С АКТИВНЫМ МАСТЕРОМ
-# =============================================================================
-if [[ -n "$ACTIVE_PEER_IP" ]]; then
-  log_msg "Обнаружен активный MASTER ($ACTIVE_PEER_IP). Проверяю слот репликации..."
+touch "$PGDATA/standby.signal"
+chown postgres:postgres "$PGDATA/standby.signal"
 
-  CONNSTR="host=$ACTIVE_PEER_IP port=$DB_PORT user=$REPL_USER application_name=$MY_NODE_NAME dbname=postgres passfile=$PGPASS_FILE"
-
-  SLOT_ROW=$(
-    sudo -u postgres PGPASSFILE="$PGPASS_FILE" PGCONNECT_TIMEOUT=3 \
-      "$PGBIN/psql" -w -d "$CONNSTR" -tAc \
-      "SELECT COALESCE(max(wal_status), 'missing'), COALESCE(bool_or(active), false) FROM pg_replication_slots WHERE slot_name = '$MY_SLOT';" \
-      2>>"$SPLITBRAIN_LOG" | tail -n 1 || true
-  )
-
-  SLOT_STATUS=$(printf '%s' "$SLOT_ROW" | awk -F'|' '{print $1}' | tr -d '[:space:]')
-  SLOT_ACTIVE=$(printf '%s' "$SLOT_ROW" | awk -F'|' '{print $2}' | tr -d '[:space:]')
-
-  if [[ -z "$SLOT_STATUS" || -z "$SLOT_ACTIVE" ]]; then
-    log_msg "КРИТИЧЕСКАЯ ОШИБКА: не удалось опросить слот $MY_SLOT на мастере $ACTIVE_PEER_IP."
-    exit 1
-  fi
-
-  log_msg "Состояние слота $MY_SLOT на мастере: wal_status=$SLOT_STATUS, active=$SLOT_ACTIVE"
-
-  BASEBACKUP_CREATE_SLOT=false
-  FORCE_BASEBACKUP=false
-
-  case "$SLOT_STATUS" in
-    missing)
-      BASEBACKUP_CREATE_SLOT=true
-      FORCE_BASEBACKUP=true
-      log_msg "Слот отсутствует на мастере. Потребуется pg_basebackup с созданием слота (-C)."
-      ;;
-    lost)
-      if [[ "$SLOT_ACTIVE" == "f" || "$SLOT_ACTIVE" == "false" ]]; then
-        log_msg "Слот в статусе lost. Удаляю старый слот..."
-        if ! sudo -u postgres PGPASSFILE="$PGPASS_FILE" PGCONNECT_TIMEOUT=5 \
-          "$PGBIN/psql" -w -d "$CONNSTR" -c \
-          "SELECT pg_drop_replication_slot('$MY_SLOT');" >>"$SPLITBRAIN_LOG" 2>&1; then
-          log_msg "КРИТИЧЕСКАЯ ОШИБКА: сбой удаления lost-слота $MY_SLOT."
-          exit 1
-        fi
-        BASEBACKUP_CREATE_SLOT=true
-        FORCE_BASEBACKUP=true
-      else
-        log_msg "КРИТИЧЕСКАЯ ОШИБКА: слот $MY_SLOT в статусе lost, но числится активным."
-        exit 1
-      fi
-      ;;
-    reserved|extended|unreserved)
-      log_msg "Слот $MY_SLOT валиден. Полноценный пересоздание не обязательно."
-      ;;
-    *)
-      log_msg "КРИТИЧЕСКАЯ ОШИБКА: неизвестный статус слота: $SLOT_STATUS."
-      exit 1
-      ;;
-  esac
-
-  # Проверка готовности узла к pg_rewind
-  CHECKSUMS=$(get_control_value "Data page checksum version")
-  CHECKSUMS=${CHECKSUMS:-0}
-  WAL_LOG_HINTS=$(get_control_value "wal_log_hints setting")
-  WAL_LOG_HINTS=${WAL_LOG_HINTS:-off}
-
-  if [[ "$CHECKSUMS" == "0" && "$WAL_LOG_HINTS" != "on" ]]; then
-    log_msg "ВНИМАНИЕ: wal_log_hints=off и data_checksums=off. pg_rewind не поддерживается кластером!"
-    FORCE_BASEBACKUP=true
-  fi
-
-  NEED_REWIND=false
-
-  if [[ "$FORCE_BASEBACKUP" != "true" ]]; then
-    set +e
-    REWIND_CHECK=$(
-      sudo -u postgres PGPASSFILE="$PGPASS_FILE" "$PGBIN/pg_rewind" \
-        --target-pgdata="$PGDATA" \
-        --source-server="$CONNSTR" \
-        --dry-run 2>&1
-    )
-    REWIND_RC=$?
-    set -e
-
-    log_msg "pg_rewind dry-run (код $REWIND_RC): $(printf '%s' "$REWIND_CHECK" | tr '\n' ' ' | head -c 250)"
-
-    if printf '%s' "$REWIND_CHECK" | grep -qi "no rewind required"; then
-      if [[ -f "$PGDATA/standby.signal" ]]; then
-        NEED_REWIND=false
-        log_msg "Откат не требуется: реплика уже синхронизирована с мастером."
-      else
-        NEED_REWIND=true
-        log_msg "Данные совпадают, но standby.signal отсутствует. Требуется инициализация standby."
-      fi
-    elif [[ "$REWIND_RC" -eq 0 ]] || printf '%s' "$REWIND_CHECK" | grep -qiE "diverged|history"; then
-      NEED_REWIND=true
-      log_msg "Требуется выполнение pg_rewind."
-    else
-      FORCE_BASEBACKUP=true
-      log_msg "pg_rewind dry-run завершился ошибкой. Требуется pg_basebackup."
-    fi
-  fi
-
-  SYNC_OK=false
-
-  if [[ ! -f "$PGDATA/standby.signal" || "$NEED_REWIND" == "true" || "$FORCE_BASEBACKUP" == "true" ]]; then
-    log_msg "Выполняю резервное копирование расходящегося хвоста перед синхронизацией..."
-
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    CURRENT_TLI=$(get_control_value "Latest checkpoint.s TimeLineID")
-    CURRENT_TLI=${CURRENT_TLI:-unknown}
-
-    TAIL_DIR="${BACKUP_ROOT}/tail_${TIMESTAMP}_tli${CURRENT_TLI}"
-    mkdir -p "$TAIL_DIR/wal" "$TAIL_DIR/meta"
-
-    cp -p "$PGDATA/global/pg_control" "$TAIL_DIR/meta/pg_control.bak" 2>/dev/null || true
-    cp -p "$PGDATA"/*.history "$TAIL_DIR/meta/" 2>/dev/null || true
-    cp -p "$PGDATA/pg_wal"/*.history "$TAIL_DIR/meta/" 2>/dev/null || true
-
-    TLI_HEX=""
-    if [[ "$CURRENT_TLI" =~ ^[0-9]+$ ]]; then
-      TLI_HEX=$(printf "%08X" "$CURRENT_TLI")
-    fi
-
-    # Архивируем ВСЕ WAL текущего разошедшегося таймлайна
-    if [[ -n "$TLI_HEX" ]]; then
-      find "$PGDATA/pg_wal" -maxdepth 1 -name "${TLI_HEX}*" -type f -exec cp -p {} "$TAIL_DIR/wal/" \; 2>/dev/null || true
-    fi
-
-    # Ротация старых бэкапов хвостов (оставляем последние 5 каталогов)
-    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name "tail_*" | sort -r | tail -n +6 | xargs -r rm -rf 2>/dev/null || true
-
-    REWIND_SUCCESS=false
-
-    # Попытка pg_rewind
-    if [[ "$FORCE_BASEBACKUP" != "true" ]]; then
-      set +e
-      timeout 180 sudo -u postgres PGPASSFILE="$PGPASS_FILE" \
-        "$PGBIN/pg_rewind" \
-        --target-pgdata="$PGDATA" \
-        --source-server="$CONNSTR" \
-        --write-recovery-conf >>"$SPLITBRAIN_LOG" 2>&1
-      REWIND_RC=$?
-      set -e
-
-      if [[ "$REWIND_RC" -eq 0 && -f "$PGDATA/standby.signal" ]]; then
-        REWIND_SUCCESS=true
-        SYNC_OK=true
-        log_msg "pg_rewind успешно выполнен, создан standby.signal."
-      else
-        log_msg "pg_rewind завершился неудачно (rc=$REWIND_RC). Переход к pg_basebackup."
-      fi
-    fi
-
-    # Выполнение pg_basebackup при невозможности rewind
-    if [[ "$REWIND_SUCCESS" != "true" ]]; then
-      log_msg "Подготовка к pg_basebackup..."
-
-      # Проверка, не является ли PGDATA точкой монтирования
-      if mountpoint -q "$PGDATA"; then
-        log_msg "КРИТИЧЕСКАЯ ОШИБКА: $PGDATA является точкой монтирования. Атомарная ротация каталогов (mv) невозможна!"
-        log_msg "Рекомендация: перенесите файлы БД в подкаталог, например: $PGDATA/data"
-        exit 1
-      fi
-
-      PG_PARENT=$(dirname "$PGDATA")
-      TEMP_PGDATA="${PG_PARENT}/.incoming_pgdata.$$"
-
-      # Проверка свободного места: нужно минимум 120% от текущего размера PGDATA
-      CURRENT_SIZE_KB=$(du -s -k "$PGDATA" 2>/dev/null | awk '{print $1}' || echo "0")
-      AVAIL_SPACE_KB=$(df -P -k "$PG_PARENT" 2>/dev/null | tail -n 1 | awk '{print $4}' || echo "0")
-      REQUIRED_SPACE_KB=$(( CURRENT_SIZE_KB * 12 / 10 ))
-
-      if (( AVAIL_SPACE_KB < REQUIRED_SPACE_KB )); then
-        log_msg "КРИТИЧЕСКАЯ ОШИБКА: недостаточно места на диске для basebackup! Требуется: ~${REQUIRED_SPACE_KB}KB, доступно: ${AVAIL_SPACE_KB}KB."
-        exit 1
-      fi
-
-      rm -rf "$TEMP_PGDATA"
-      mkdir -p "$TEMP_PGDATA"
-      chown postgres:postgres "$TEMP_PGDATA"
-      chmod 0700 "$TEMP_PGDATA"
-
-      BASEBACKUP_ARGS=(
-        -d "$CONNSTR"
-        -D "$TEMP_PGDATA"
-        -Fp -Xs -R
-        -S "$MY_SLOT"
-      )
-
-      if [[ "$BASEBACKUP_CREATE_SLOT" == "true" ]]; then
-        BASEBACKUP_ARGS+=( -C )
-        log_msg "Добавлен флаг -C для создания слота $MY_SLOT на мастере."
-      fi
-
-      set +e
-      sudo -u postgres PGPASSFILE="$PGPASS_FILE" \
-        "$PGBIN/pg_basebackup" "${BASEBACKUP_ARGS[@]}" >>"$SPLITBRAIN_LOG" 2>&1
-      BB_RC=$?
-      set -e
-
-      if [[ "$BB_RC" -eq 0 && -f "$TEMP_PGDATA/standby.signal" && -f "$TEMP_PGDATA/PG_VERSION" ]]; then
-        log_msg "pg_basebackup успешно загружен. Выполняю атомарную ротацию каталогов..."
-
-        BACKUP_OLD="${PG_PARENT}/.old_pgdata.$$"
-
-        if mv "$PGDATA" "$BACKUP_OLD" 2>>"$SPLITBRAIN_LOG" && \
-           mv "$TEMP_PGDATA" "$PGDATA" 2>>"$SPLITBRAIN_LOG"; then
-          rm -rf "$BACKUP_OLD" 2>/dev/null || true
-          SYNC_OK=true
-          TEMP_PGDATA="" # Снимаем с trap
-          log_msg "Каталог PGDATA успешно обновлен из basebackup."
-        else
-          log_msg "КРИТИЧЕСКАЯ ОШИБКА: сбой ротации каталогов PGDATA!"
-          if [[ -d "$BACKUP_OLD" && ! -d "$PGDATA" ]]; then
-            mv "$BACKUP_OLD" "$PGDATA" 2>/dev/null || true
-          fi
-          exit 1
-        fi
-      else
-        log_msg "КРИТИЧЕСКАЯ ОШИБКА: pg_basebackup упал (rc=$BB_RC) или не создал standby.signal. Исходный PGDATA не затронут."
-        exit 1
-      fi
-    fi
-
-    if [[ "$SYNC_OK" != "true" ]]; then
-      log_msg "КРИТИЧЕСКАЯ ОШИБКА: узел не приведен в состояние валидного standby."
-      exit 1
-    fi
-  fi
-
-  # Сброс transient-атрибута Pacemaker
-  if command -v crm_attribute >/dev/null 2>&1; then
-    crm_attribute -N "$MY_NODE_NAME" -l reboot -n master-pgsql -D 2>/dev/null || true
-  fi
-fi
-
-# =============================================================================
-# 5. ПРОВЕРКА И ОБНОВЛЕНИЕ ПАРАМЕТРОВ РЕПЛИКАЦИИ
-# =============================================================================
-if [[ -f "$PGDATA/standby.signal" ]]; then
-  AUTO_CONF="$PGDATA/postgresql.auto.conf"
-  touch "$AUTO_CONF"
-
-  # Удаляем старую директиву primary_slot_name (если была) и записываем актуальную
-  sed -i '/^[[:space:]]*primary_slot_name[[:space:]]*=/d' "$AUTO_CONF"
-  echo "primary_slot_name = '${MY_SLOT}'" >> "$AUTO_CONF"
-  chown postgres:postgres "$AUTO_CONF" "$PGDATA/standby.signal" 2>/dev/null || true
-  chmod 0600 "$AUTO_CONF" 2>/dev/null || true
-  log_msg "Параметр primary_slot_name = '${MY_SLOT}' успешно зафиксирован в postgresql.auto.conf"
-fi
+touch "$PGDATA/postgresql.auto.conf"
+sed -i -E '/^(primary_conninfo|primary_slot_name|recovery_target_timeline)/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
+cat <<BOOT_CONF_EOF >> "$PGDATA/postgresql.auto.conf"
+primary_conninfo = 'host=${PEER_IP},${PEER_ALT_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${MY_NODE_NAME} connect_timeout=2 target_session_attrs=read-write'
+primary_slot_name = '${MY_SLOT}'
+recovery_target_timeline = 'latest'
+BOOT_CONF_EOF
+chown postgres:postgres "$PGDATA/postgresql.auto.conf"
+chmod 0600 "$PGDATA/postgresql.auto.conf"
 
 # =============================================================================
 # 6. ФИКСАЦИЯ РЕЖИМА ЗАПУСКА ДЛЯ СТОРОЖА ДЕГРАДИРОВАННОГО РЕЖИМА
@@ -583,12 +350,6 @@ FINAL_STATE=${FINAL_STATE:-unknown}
 if [[ "$FINAL_STATE" == "unknown" ]]; then
   log_msg "КРИТИЧЕСКАЯ ОШИБКА: не удалось получить финальный статус БД."
   exit 1
-fi
-
-if [[ -f "$PGDATA/standby.signal" ]] || [[ "$FINAL_STATE" == *"recovery"* ]]; then
-  DETECTED_ROLE="SLAVE"
-else
-  DETECTED_ROLE="MASTER"
 fi
 
 # Внутренний heredoc использует маркер BOOT_CONF_EOF во избежание коллизий
@@ -620,16 +381,65 @@ chmod 0755 /usr/local/sbin/cluster-boot-analyzer.sh
 cat << 'EOF' > /usr/local/sbin/cluster-degraded-unblock.sh
 #!/bin/bash
 set -euo pipefail
+
 source /etc/default/ha-cluster
-[[ -f "$BOOT_MODE_FILE" ]] && source "$BOOT_MODE_FILE"
+[[ -f "${BOOT_MODE_FILE:-}" ]] && source "$BOOT_MODE_FILE"
 
 log_msg() { timeout 2 logger -t cluster-watchdog "$1" || true; }
 
+# Корректное завершение при остановке службы через systemctl
+trap 'log_msg "Служба остановлена извне. Прерывание ожидания."; exit 0' SIGTERM SIGINT
+
+is_cluster_quorate() {
+  # Проверка наличия кворума (оба узла в сети)
+  corosync-quorumtool -s 2>/dev/null | grep -q "Quorate:.*Yes"
+}
+
 unblock_quorum_safely() {
   log_msg "Выполняю отмену wait_for_all для кворума..."
-  pcs quorum unblock --yes 2>/dev/null || \
-  corosync-cmapctl -s quorum.cancel_wait_for_all u8 1 2>/dev/null || true
+
+  # 1. Штатный метод через corosync-quorumtool (-u / --unblock)
+  if corosync-quorumtool -u >/dev/null 2>&1; then
+    log_msg "Флаг wait_for_all успешно сброшен через corosync-quorumtool."
+  # 2. Резервный метод через прямую запись в cmap Corosync
+  elif corosync-cmapctl -s quorum.cancel_wait_for_all u8 1 >/dev/null 2>&1; then
+    log_msg "Флаг wait_for_all успешно сброшен через corosync-cmapctl."
+  else
+    log_msg "ОШИБКА: Не удалось отменить wait_for_all ни через quorumtool, ни через cmapctl!"
+    return 1
+  fi
+
+  # Контрольная пауза и проверка результата
+  sleep 1
+  if is_cluster_quorate; then
+    log_msg "Кворум успешно активирован на единственном узле."
+  else
+    log_msg "ПРЕДУПРЕЖДЕНИЕ: wait_for_all отменен, но кворум не появился. Проверьте параметр two_node в corosync.conf."
+  fi
 }
+
+# Функция динамического ожидания кворума
+wait_for_quorum_or_timeout() {
+  local max_wait="$1"
+  local interval=2
+  local waited=0
+
+  while (( waited < max_wait )); do
+    if is_cluster_quorate; then
+      return 0
+    fi
+    sleep "$interval"
+    waited=$(( waited + interval ))
+  done
+
+  is_cluster_quorate
+}
+
+# 1. Если второй узел уже на связи — выходим немедленно
+if is_cluster_quorate; then
+  log_msg "Оба узла в строю (кворум уже собран). Скрипт не требуется, завершение."
+  exit 0
+fi
 
 LOCAL_IPS=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)
 if echo "$LOCAL_IPS" | grep -qw "$NODE1_RING0_IP" || echo "$LOCAL_IPS" | grep -qw "$NODE1_RING1_IP"; then
@@ -644,17 +454,19 @@ else
   EXTRA_DELAY="${NODE2_ASYMMETRIC_DELAY_SEC:-120}"
 fi
 
-TOTAL_WAIT=$(( ${UNBLOCK_TIMEOUT_SEC:-$CRASH_TIMEOUT_SEC} + EXTRA_DELAY ))
-log_msg "Ожидание сбора кворума: ${TOTAL_WAIT} сек (Режим: ${MODE:-UNKNOWN}, Роль: ${LAST_ROLE:-UNKNOWN})..."
-sleep "$TOTAL_WAIT"
+TOTAL_WAIT=$(( ${UNBLOCK_TIMEOUT_SEC:-${CRASH_TIMEOUT_SEC:-120}} + EXTRA_DELAY ))
+log_msg "Второй узел не обнаружен. Ожидание сбора кворума до ${TOTAL_WAIT} сек (Режим: ${MODE:-UNKNOWN}, Роль: ${LAST_ROLE:-UNKNOWN})..."
 
-if corosync-quorumtool -s 2>/dev/null | grep -q "Quorate:.*Yes"; then
-  log_msg "Обе ноды в строю, кворум собран штатно."
+# 2. Динамический цикл ожидания: завершается сразу, как только появляется второй узел
+if wait_for_quorum_or_timeout "$TOTAL_WAIT"; then
+  log_msg "Второй узел подключился, кворум собран штатно. Отмена degraded-режима."
   exit 0
 fi
 
+log_msg "Таймаут истек, второй узел не появился. Проверяю сетевой периметр..."
+
 ROUTER_OK="no"
-for rip in $ROUTER_IPS; do
+for rip in ${ROUTER_IPS:-}; do
   if ping -c 2 -W 1 "$rip" >/dev/null 2>&1 || arping -I "$CLUSTER_VIP_NIC" -c 2 -w 2 "$rip" >/dev/null 2>&1; then
     ROUTER_OK="yes"
     break
@@ -681,11 +493,15 @@ if [[ "${LAST_ROLE:-}" == "MASTER" ]]; then
   log_msg "Узел был MASTER. Разблокировка кворума."
   unblock_quorum_safely
 elif [[ "${LAST_ROLE:-}" == "SLAVE" ]]; then
-  sleep "${NODE2_ASYMMETRIC_DELAY_SEC:-120}"
-  if corosync-quorumtool -s 2>/dev/null | grep -q "Quorate:.*Yes"; then
+  log_msg "Узел был SLAVE. Ожидание мастера еще ${NODE2_ASYMMETRIC_DELAY_SEC:-120} сек..."
+  if wait_for_quorum_or_timeout "${NODE2_ASYMMETRIC_DELAY_SEC:-120}"; then
+    log_msg "Мастер появился в сети, кворум собран штатно."
     exit 0
   fi
   log_msg "Мастер не появился. Разблокировка кворума для промоута реплики."
+  unblock_quorum_safely
+else
+  log_msg "Роль не MASTER/SLAVE (${LAST_ROLE:-UNKNOWN}). Разблокировка кворума."
   unblock_quorum_safely
 fi
 EOF
@@ -720,18 +536,26 @@ cat << 'EOF' > /etc/systemd/system/cluster-degraded-unblock.service
 [Unit]
 Description=Unblock Corosync WaitForAll quorum after timeout (Degraded Mode)
 After=corosync.service pacemaker.service
+PartOf=pacemaker.service
 
 [Service]
 Type=oneshot
 TimeoutStartSec=infinity
 EnvironmentFile=/etc/default/ha-cluster
+
+ExecCondition=/bin/bash -c '! corosync-quorumtool -s 2>/dev/null | grep -q "Quorate:.*Yes"'
+
 ExecStart=/usr/local/sbin/cluster-degraded-unblock.sh
+
+[Install]
+WantedBy=pacemaker.service
 EOF
 
 cat << 'EOF' > /etc/systemd/system/cluster-degraded-unblock.timer
 [Unit]
 Description=Start Degraded Mode Watchdog Timer after Pacemaker boot
 PartOf=pacemaker.service
+After=pacemaker.service
 
 [Timer]
 OnActiveSec=5sec
@@ -739,7 +563,7 @@ AccuracySec=1s
 Unit=cluster-degraded-unblock.service
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=pacemaker.service multi-user.target
 EOF
 
 mkdir -p /etc/systemd/system/corosync.service.d
