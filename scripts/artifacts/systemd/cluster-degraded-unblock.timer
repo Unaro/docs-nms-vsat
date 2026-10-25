@@ -1,0 +1,12 @@
+[Unit]
+Description=Legacy degraded quorum policy timer
+PartOf=pacemaker.service
+After=pacemaker.service
+
+[Timer]
+OnActiveSec=5s
+AccuracySec=1s
+Unit=cluster-degraded-unblock.service
+
+[Install]
+WantedBy=pacemaker.service

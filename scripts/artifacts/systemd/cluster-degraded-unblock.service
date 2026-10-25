@@ -1,0 +1,9 @@
+[Unit]
+Description=Legacy degraded quorum unblock policy
+After=corosync.service pacemaker.service
+PartOf=pacemaker.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/usr/local/sbin/cluster-degraded-unblock.sh

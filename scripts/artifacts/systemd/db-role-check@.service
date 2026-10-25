@@ -1,0 +1,16 @@
+[Unit]
+Description=PostgreSQL Role Check Handler
+Requires=db-role-check.socket
+[Service]
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/default/ha-cluster
+ExecStart=/usr/local/bin/db-role-check.sh
+StandardInput=socket
+StandardOutput=socket
+StandardError=null
+LogLevelMax=warning
+LimitNOFILE=65536
+RuntimeMaxSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes

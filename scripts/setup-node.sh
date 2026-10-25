@@ -8,7 +8,6 @@ set -euo pipefail
 ENV_FILE="/etc/default/ha-cluster"
 LOG_FILE="/var/log/setup-node.log"
 
-exec > >(tee -a "$LOG_FILE") 2>&1
 
 # 1. Валидация аргументов запуска
 NODE_ROLE=""
@@ -40,7 +39,25 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "[ОШИБКА] Файл $ENV_FILE не найден! Сначала выполните configure-ha.sh."
   exit 1
 fi
+exec > >(tee -a "$LOG_FILE") 2>&1
 source "$ENV_FILE"
+for value in "$REPL_USER" "$REPL_PASS" "$HACLUSTER_PASS"; do
+  [[ $value != *$'\n'* && $value != *$'\r'* ]] || { echo 'Переводы строк в учётных данных не поддерживаются' >&2; exit 1; }
+done
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/artifacts.sh"
+[[ $PGDATA == /* && $PGDATA != / && ! -L $PGDATA ]] || { echo 'Небезопасный путь PGDATA' >&2; exit 1; }
+expected_node=$NODE1_NAME
+[[ $NODE_ROLE == STANDBY ]] && expected_node=$NODE2_NAME
+[[ $(hostname -s) == "$expected_node" ]] || { echo "Эту роль необходимо настраивать на узле $expected_node" >&2; exit 1; }
+if [[ $NODE_ROLE != STOP_MASTER && -d $PGDATA && -n $(find "$PGDATA" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+  echo 'Первоначальная настройка требует пустого PGDATA; для существующих данных используйте восстановление кластера.' >&2
+  exit 1
+fi
+if systemctl is-active --quiet pacemaker; then
+  echo '[ОШИБКА] Подготовка узла запрещена при работающем Pacemaker.' >&2
+  exit 1
+fi
 
 if [[ "$NODE_ROLE" == "STOP_MASTER" ]]; then
   echo "====================================================================="
@@ -77,134 +94,36 @@ echo "====================================================================="
 # 2. Очистка и фиксация /etc/hosts
 sed -i '/127.0.1.1/d' /etc/hosts
 sed -i '/# --- HA-CLUSTER-HOSTS-BEGIN ---/,/# --- HA-CLUSTER-HOSTS-END ---/d' /etc/hosts
-cat << EOF >> /etc/hosts
-# --- HA-CLUSTER-HOSTS-BEGIN ---
-$NODE1_RING0_IP    ${NODE1_NAME}-ring0 $NODE1_NAME
-$NODE2_RING0_IP    ${NODE2_NAME}-ring0 $NODE2_NAME
-$NODE1_RING1_IP    ${NODE1_NAME}-ring1
-$NODE2_RING1_IP    ${NODE2_NAME}-ring1
-# --- HA-CLUSTER-HOSTS-END ---
-EOF
+render_artifact hosts.block.tpl /run/ha-hosts.block
+cat /run/ha-hosts.block >> /etc/hosts
+rm -f /run/ha-hosts.block
 
 # 3. Тюнинг ядра для отказоустойчивости
-cat << 'EOF' > /etc/sysctl.d/99-ha-cluster.conf
-kernel.hung_task_timeout_secs = 45
-kernel.hung_task_panic = 1
-kernel.panic = 5
-kernel.panic_on_oops = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_mtu_probing = 1
-fs.file-max = 2097152
-EOF
+install_artifact sysctl/99-ha-cluster.conf /etc/sysctl.d/99-ha-cluster.conf
 sysctl --system >/dev/null 2>&1 || true
 
 # 4. Файл паролей .pgpass и пароль для pcsd
 mkdir -p "$(dirname "$PGPASS_FILE")"
-echo "*:${DB_PORT}:*:${REPL_USER}:${REPL_PASS}" > "$PGPASS_FILE"
+pgpass_user=${REPL_USER//\\/\\\\}; pgpass_user=${pgpass_user//:/\\:}
+pgpass_password=${REPL_PASS//\\/\\\\}; pgpass_password=${pgpass_password//:/\\:}
+printf '*:%s:*:%s:%s\n' "$DB_PORT" "$pgpass_user" "$pgpass_password" > "$PGPASS_FILE"
 chown postgres:postgres "$PGPASS_FILE" 2>/dev/null || true
 chmod 0600 "$PGPASS_FILE"
 
 echo "hacluster:${HACLUSTER_PASS}" | chpasswd 2>/dev/null || true
 
 # 5. Скрипт проверки роли для балансировщика (с вычитыванием stdin и чистым ответом)
-cat << 'EOF' > /usr/local/bin/db-role-check.sh
-#!/bin/bash
-# 1. Вычитываем входящий HTTP-запрос из stdin для предотвращения TCP RST в HAProxy
-while read -r line; do
-  line=$(echo "$line" | tr -d '\r')
-  [[ -z "$line" ]] && break
-done
-
-DB_PORT="${DB_PORT:-5432}"
-PGBIN="${PGBIN:-/usr/lib/postgresql/16/bin}"
-PSQL_CMD="$PGBIN/psql"
-if ! command -v "$PSQL_CMD" >/dev/null 2>&1; then
-  PSQL_CMD="psql"
-fi
-
-# 2. Таймаут через PGOPTIONS исключает паразитный вывод команды SET
-OUT=$(timeout 2 env PGOPTIONS="-c statement_timeout=1500ms" "$PSQL_CMD" \
-  -h /var/run/postgresql -p "$DB_PORT" -U postgres -d postgres -tAc \
-  "SELECT pg_is_in_recovery();" -X 2>/dev/null | tail -n 1 || echo "err")
-OUT=$(echo "$OUT" | tr -d '[:space:]')
-
-if [[ "$OUT" == "f" ]]; then
-  IS_RO=$(timeout 2 env PGOPTIONS="-c statement_timeout=1500ms" "$PSQL_CMD" \
-    -h /var/run/postgresql -p "$DB_PORT" -U postgres -d postgres -tAc \
-    "SHOW transaction_read_only;" -X 2>/dev/null | tail -n 1 || echo "on")
-  IS_RO=$(echo "$IS_RO" | tr -d '[:space:]')
-  if [[ "$IS_RO" == "off" ]]; then
-    printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\nMaster\r\n"
-    exit 0
-  fi
-fi
-
-printf "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nSlave\r\n"
-exit 1
-EOF
+install_artifact bin/db-role-check.sh /usr/local/bin/db-role-check.sh 0755
 chmod +x /usr/local/bin/db-role-check.sh
 
 # 6. Сокет db-role-check (порт DB_CHECK_PORT)
-cat << EOF > /etc/systemd/system/db-role-check.socket
-[Unit]
-Description=PostgreSQL Role Check Socket for HAProxy
-[Socket]
-ListenStream=${DB_CHECK_PORT}
-Accept=yes
-LogLevelMax=warning
-[Install]
-WantedBy=sockets.target
-EOF
+render_artifact systemd/db-role-check.socket.tpl /etc/systemd/system/db-role-check.socket
 
-cat << 'EOF' > /etc/systemd/system/db-role-check@.service
-[Unit]
-Description=PostgreSQL Role Check Handler
-Requires=db-role-check.socket
-[Service]
-User=postgres
-Group=postgres
-EnvironmentFile=/etc/default/ha-cluster
-ExecStart=/usr/local/bin/db-role-check.sh
-StandardInput=socket
-StandardOutput=socket
-StandardError=null
-LogLevelMax=warning
-LimitNOFILE=65536
-EOF
+install_artifact systemd/db-role-check@.service /etc/systemd/system/db-role-check@.service
 
 # 7. Конфигурация HAProxy
-cat << EOF > /etc/haproxy/haproxy.cfg
-global
-  log /dev/log local0 warning
-  maxconn 500
-  user haproxy
-  group haproxy
-  daemon
-
-defaults
-  log     global
-  mode    tcp
-  option  tcplog
-  retries 3
-  timeout queue   1m
-  timeout connect 5s
-  timeout client  30m
-  timeout server  30m
-  timeout check   2s
-
-listen postgres_master
-  bind 127.0.0.1:${HAPROXY_DB_BIND_PORT}
-  mode tcp
-  option httpchk GET /
-  http-check expect status 200
-  default-server inter 2s fall 2 rise 2 on-marked-down shutdown-sessions
-
-  server node1_db_r0 ${NODE1_RING0_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT}
-  server node2_db_r0 ${NODE2_RING0_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT}
-  server node1_db_r1 ${NODE1_RING1_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT} backup
-  server node2_db_r1 ${NODE2_RING1_IP}:${DB_PORT} maxconn 100 check port ${DB_CHECK_PORT} backup
-EOF
+render_artifact haproxy/haproxy.cfg.tpl /etc/haproxy/haproxy.cfg
+haproxy -c -f /etc/haproxy/haproxy.cfg
 
 # Функция записи директив PostgreSQL
 configure_postgres_files() {
@@ -217,49 +136,12 @@ configure_postgres_files() {
   sed -i '/# --- HA-CLUSTER-PG-BEGIN ---/,/# --- HA-CLUSTER-PG-END ---/d' "${PGDATA}/postgresql.conf"
   sed -i '/unix_socket_directories/d' "${PGDATA}/postgresql.conf"
 
-  cat << EOF >> "${PGDATA}/postgresql.conf"
-# --- HA-CLUSTER-PG-BEGIN ---
-listen_addresses = '*'
-unix_socket_directories = '/var/run/postgresql, /tmp'
-max_connections = ${MAX_CONNECTIONS}
-shared_buffers = 256MB
-wal_level = replica
-wal_log_hints = on
-full_page_writes = on
-track_commit_timestamp = on
-hot_standby = on
-hot_standby_feedback = on
-recovery_target_timeline = 'latest'
-superuser_reserved_connections = 3
-max_slot_wal_keep_size = ${MAX_SLOT_WAL_KEEP_SIZE}
-wal_keep_size = ${WAL_KEEP_SIZE}
-password_encryption = scram-sha-256
-idle_in_transaction_session_timeout = '15000ms'
-statement_timeout = '30000ms'
-lock_timeout = '5000ms'
-tcp_keepalives_idle = 15
-tcp_keepalives_interval = 5
-tcp_keepalives_count = 3
-# --- HA-CLUSTER-PG-END ---
-EOF
+  render_artifact postgresql/ha.conf.tpl "$PGDATA/.ha.conf.block"
+  cat "$PGDATA/.ha.conf.block" >> "$PGDATA/postgresql.conf"
+  rm -f "$PGDATA/.ha.conf.block"
 
   # Полная чистая перезапись pg_hba.conf
-  cat << EOF > "${PGDATA}/pg_hba.conf"
-# --- HA-REPLICATION-RULES ---
-local   all             all                                     trust
-host    all             all             127.0.0.1/32            trust
-host    all             all             ::1/128                 trust
-
-host    all             all             10.0.0.0/24             trust
-host    all             all             192.168.0.0/16          trust
-
-local   replication     all                                     trust
-host    replication     ${REPL_USER}    127.0.0.1/32            trust
-host    replication     ${REPL_USER}    ::1/128                 trust
-host    replication     ${REPL_USER}    10.0.0.0/24             trust
-host    replication     ${REPL_USER}    192.168.0.0/16          trust
-# --- HA-REPLICATION-END ---
-EOF
+  render_artifact postgresql/pg_hba.conf.tpl "$PGDATA/pg_hba.conf"
 }
 
 # Гарантируем права на каталог сокетов Unix
@@ -277,7 +159,6 @@ if [[ "$NODE_ROLE" == "MASTER" ]]; then
   if [[ ! -f "$PGDATA/PG_VERSION" || ! -f "$PGDATA/postgresql.conf" || ! -f "$PGDATA/pg_hba.conf" ]]; then
     echo "[INFO] Инициализирую PostgreSQL в каталоге: $PGDATA"
     mkdir -p "$(dirname "$PGDATA")"
-    rm -rf "$PGDATA"
     mkdir -p "$PGDATA"
     chown postgres:postgres "$PGDATA"
     chmod 0700 "$PGDATA"
@@ -295,11 +176,9 @@ if [[ "$NODE_ROLE" == "MASTER" ]]; then
 
   touch "$PGDATA/postgresql.auto.conf"
   sed -i -E '/^(primary_conninfo|primary_slot_name|recovery_target_timeline)/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
-  cat << EOF >> "$PGDATA/postgresql.auto.conf"
-primary_conninfo = 'host=${NODE2_RING0_IP},${NODE2_RING1_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${NODE1_NAME} connect_timeout=2 target_session_attrs=read-write'
-primary_slot_name = '${REPL_SLOT_NODE1}'
-recovery_target_timeline = 'latest'
-EOF
+  render_artifact postgresql/node1.auto.conf.tpl "$PGDATA/.auto.conf.block"
+  cat "$PGDATA/.auto.conf.block" >> "$PGDATA/postgresql.auto.conf"
+  rm -f "$PGDATA/.auto.conf.block"
   chown postgres:postgres "$PGDATA/postgresql.auto.conf"
   chmod 0600 "$PGDATA/postgresql.auto.conf"
 
@@ -314,35 +193,10 @@ EOF
     exit 1
   fi
 
-  sudo -u postgres "$PGBIN/psql" -h /var/run/postgresql -p "$DB_PORT" -d postgres -v ON_ERROR_STOP=1 <<SQL
-DO \$\$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${REPL_USER}') THEN
-      CREATE ROLE ${REPL_USER} WITH REPLICATION LOGIN PASSWORD '${REPL_PASS}';
-  ELSE
-      ALTER ROLE ${REPL_USER} WITH REPLICATION LOGIN PASSWORD '${REPL_PASS}';
-  END IF;
-END
-\$\$;
-
-GRANT pg_read_all_data TO ${REPL_USER};
-GRANT pg_read_server_files TO ${REPL_USER};
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) TO ${REPL_USER};
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text, bigint, bigint, boolean) TO ${REPL_USER};
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text, boolean) TO ${REPL_USER};
-GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_dir(text, boolean, boolean) TO ${REPL_USER};
-
-
-SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE1}', true)
-WHERE NOT EXISTS (
-  SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE1}'
-);
-
-SELECT pg_create_physical_replication_slot('${REPL_SLOT_NODE2}', true)
-WHERE NOT EXISTS (
-  SELECT 1 FROM pg_replication_slots WHERE slot_name = '${REPL_SLOT_NODE2}'
-);
-SQL
+  sudo -u postgres "$PGBIN/psql" -X -h /var/run/postgresql -p "$DB_PORT" -d postgres \
+    -v ON_ERROR_STOP=1 -v repl_user="$REPL_USER" -v repl_pass="$REPL_PASS" \
+    -v slot1="$REPL_SLOT_NODE1" -v slot2="$REPL_SLOT_NODE2" \
+    < "$HA_ARTIFACTS_DIR/postgresql/provision.sql"
 
   echo "[INFO] Временный master запущен и слушает порт $DB_PORT."
   echo "[INFO] Теперь на node2 выполните:"
@@ -373,12 +227,11 @@ elif [[ "$NODE_ROLE" == "STANDBY" ]]; then
   fi
 
   mkdir -p "$(dirname "$PGDATA")"
-  rm -rf "${PGDATA:?}"/*
   mkdir -p "$PGDATA"
   chown postgres:postgres "$PGDATA"
   chmod 0700 "$PGDATA"
 
-  sudo -u postgres PGPASSFILE="$PGPASS_FILE" "$PGBIN/pg_basebackup" \
+  timeout --kill-after=5s "${BASEBACKUP_TIMEOUT_SEC:-540}s" sudo -u postgres env PGPASSFILE="$PGPASS_FILE" "$PGBIN/pg_basebackup" \
     -h "$TARGET_MASTER_IP" \
     -p "$DB_PORT" \
     -U "$REPL_USER" \
@@ -398,11 +251,9 @@ elif [[ "$NODE_ROLE" == "STANDBY" ]]; then
   # Фиксируем подключение по двум кольцам, слот и application_name для Pacemaker/pgsqlms
   touch "$PGDATA/postgresql.auto.conf"
   sed -i -E '/^(primary_conninfo|primary_slot_name|recovery_target_timeline)/d' "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
-  cat << EOF >> "$PGDATA/postgresql.auto.conf"
-primary_conninfo = 'host=${NODE1_RING0_IP},${NODE1_RING1_IP} port=${DB_PORT} user=${REPL_USER} passfile=${PGPASS_FILE} application_name=${NODE2_NAME} connect_timeout=2 target_session_attrs=read-write'
-primary_slot_name = '${REPL_SLOT_NODE2}'
-recovery_target_timeline = 'latest'
-EOF
+  render_artifact postgresql/node2.auto.conf.tpl "$PGDATA/.auto.conf.block"
+  cat "$PGDATA/.auto.conf.block" >> "$PGDATA/postgresql.auto.conf"
+  rm -f "$PGDATA/.auto.conf.block"
 
   configure_postgres_files
 
@@ -413,7 +264,33 @@ EOF
   echo "[INFO] Выполните на node1: sudo $0 --stop-master"
 fi
 
-# 9. Фиксация служб в systemd
+# 9. Установка OCF-обертки pgsqlms-ha для автоматического восстановления
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OCF_WRAPPER_SRC="${SCRIPT_DIR}/pgsqlms-ha"
+OCF_WRAPPER_DST="/usr/lib/ocf/resource.d/heartbeat/pgsqlms-ha"
+
+if [[ -f "$OCF_WRAPPER_SRC" ]]; then
+  echo "[INFO] Устанавливаем OCF-агент pgsqlms-ha для автоматического восстановления БД..."
+  install -D -m 0755 -o root -g root "$OCF_WRAPPER_SRC" "$OCF_WRAPPER_DST"
+  
+  # Проверка базового PAF-агента
+  if [[ ! -x "/usr/lib/ocf/resource.d/heartbeat/pgsqlms" ]]; then
+    echo "[ОШИБКА] Базовый агент PAF (pgsqlms) не найден!"
+    echo "                 Установите пакет: apt install resource-agents-paf (Debian/Ubuntu)"
+    echo "                                   или: yum install resource-agents-paf (RHEL/CentOS)"
+    exit 1
+  else
+    echo "[УСПЕХ] Агент pgsqlms-ha установлен: $OCF_WRAPPER_DST"
+  fi
+else
+  echo "[ПРЕДУПРЕЖДЕНИЕ] Файл $OCF_WRAPPER_SRC не найден. OCF-агент не установлен."
+  echo "                 Разместите скрипт pgsqlms-ha в директории скриптов."
+  exit 1
+fi
+
+# SELinux/AppArmor не отключаем: при отказах настраиваются адресные политики.
+
+# 10. Фиксация служб в systemd
 systemctl daemon-reload
 
 # Отключаем автозапуск системных сервисов (управление передается Pacemaker)
