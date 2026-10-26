@@ -1,0 +1,109 @@
+flowchart TD
+    Start(["Старт: запуск OCF-агента pgsqlms-ha"]) --> CheckPAFBase{"Базовый агент PAF\n$REAL_PAF исполняемый?"}
+
+    %% Предварительные проверки и валидация
+    CheckPAFBase -->|Нет| ErrNoPAF["Выход: OCF_ERR_INSTALLED (5)"]
+    CheckPAFBase -->|Да| CheckActionMeta{"Действие == meta-data?"}
+
+    CheckActionMeta -->|Да| ExecMetaData["Вызов $REAL_PAF meta-data\nПодмена имени на pgsqlms-ha\nВыход exit $?"]
+    CheckActionMeta -->|Нет| CheckEnvSecurity{"Проверка безопасности $ENV_FILE\n(владелец root, права не /022)?"}
+
+    CheckEnvSecurity -->|Небезопасен / нет| ErrEnvSecurity["Выход: OCF_ERR_CONFIGURED (6)"]
+    CheckEnvSecurity -->|Безопасен| SourceEnv["source $ENV_FILE"]
+
+    SourceEnv --> ValidateEnv{"Проверка параметров:\n- IP-адреса, ноды, слоты\n- Числовые таймауты\n- Безопасность путей (не symlink)"}
+    ValidateEnv -->|Ошибка| ErrConfig["Выход: OCF_ERR_CONFIGURED (6)"]
+    ValidateEnv -->|Успешно| DetectNodeTopology["Определение локальной роли и пира\n(MY_SLOT, PEER_R0_IP, PEER_R1_IP)"]
+
+    %% Диспетчер действий и блокировка
+    DetectNodeTopology --> CheckActionValidate{"Действие == validate-all?"}
+    CheckActionValidate -->|Да| ExecValidateAll["Проверка бинарников (bash, tar, psql, pg_rewind...)\nexec $REAL_PAF validate-all"]
+    CheckActionValidate -->|Нет| CheckKnownAction{"Действие:\nstart | stop | monitor |\npromote | demote | notify | reload?"}
+
+    CheckKnownAction -->|Иное| ExecPAFDirect["exec $REAL_PAF $@\n(делегирование без обертки)"]
+    CheckKnownAction -->|Да| AcquireLock["mkdir $STATE_DIR (0700)\nflock -w 1 на agent.lock (дескриптор 9)"]
+
+    AcquireLock -->|Блокировка занята| ErrLock["Ошибка: параллельная операция\nВыход: OCF_ERR_GENERIC (1)"]
+    AcquireLock -->|Успешно| DispatchAction{"Ветвление по $ACTION"}
+
+    %% Ветка PROMOTE
+    subgraph SubPromote ["Действие: PROMOTE"]
+        DispatchAction -->|promote| PAFPromote["Вызов $REAL_PAF promote"]
+        PAFPromote --> CheckPromoteOk{"Успешно (OCF_SUCCESS)?"}
+        CheckPromoteOk -->|Да| EnsureSlots["ensure_slots_on_master:\nсоздание физических слотов репликации\nчерез psql (local)"]
+        CheckPromoteOk -->|Нет| ExitPromote["Выход с кодом PAF"]
+        EnsureSlots --> ExitPromote
+    end
+
+    %% Ветка MONITOR
+    subgraph SubMonitor ["Действие: MONITOR"]
+        DispatchAction -->|monitor| CheckInterval{"CRM_meta_interval == 0\n(Probe-опрос)?"}
+        CheckInterval -->|Да| CheckLocalProbe{"local_instance_state\n(статус pg_ctl)?"}
+        CheckLocalProbe -->|OCF_NOT_RUNNING| ExitProbeStopped["Выход: OCF_NOT_RUNNING (7)\n(подготовка отложена до start)"]
+        CheckLocalProbe -->|OCF_SUCCESS| ExecPAFProbe["$REAL_PAF monitor\nВыход с кодом PAF"]
+        CheckLocalProbe -->|Иначе| ErrProbe["Выход: OCF_ERR_GENERIC (1)"]
+
+        CheckInterval -->|Нет| PAFMonitor["$REAL_PAF monitor"]
+        PAFMonitor --> CheckMonitorRC{"Код возврата PAF"}
+        CheckMonitorRC -->|Не OCF_SUCCESS| ExitMonitorRC["Выход с кодом PAF"]
+        CheckMonitorRC -->|OCF_SUCCESS| CheckDivergence{"check_divergence_running:\nСтатус wal_receiver == streaming?"}
+        CheckDivergence -->|Да| CleanDivergenceFlags["Удаление маркеров no_stream.ts,\nneed_resync.flag\nВыход: OCF_SUCCESS (0)"]
+        CheckDivergence -->|Нет стриминга| CheckPeerPrimary{"Primary доступен\n(select_primary)?"}
+        CheckPeerPrimary -->|Нет| ExitMonitorRC
+        CheckPeerPrimary -->|Да| CheckGracePeriod{"Простой стриминга >=\nGRACE_PERIOD_SEC (30s)?"}
+        CheckGracePeriod -->|Нет| UpdateNoStreamTS["Запись timestamp в no_stream.ts\nВыход: OCF_SUCCESS (0)"]
+        CheckGracePeriod -->|Да| MarkResyncNeeded["touch $NEED_RESYNC_FLAG\nВыход: OCF_ERR_GENERIC (1)\n(сигнал Pacemaker о деградации)"]
+    end
+
+    %% Ветка STOP
+    subgraph SubStop ["Действие: STOP"]
+        DispatchAction -->|stop| PAFStop["Вызов $REAL_PAF stop"]
+        PAFStop --> CheckStopSuccess{"Успешно (OCF_SUCCESS)?"}
+        CheckStopSuccess -->|Да| RemoveTS["Удаление $NO_STREAM_TS_FILE"]
+        CheckStopSuccess -->|Нет| ExitStop["Выход с кодом PAF"]
+        RemoveTS --> ExitStop
+    end
+
+    %% Ветка START
+    subgraph SubStart ["Действие: START (с автовосстановлением)"]
+        DispatchAction -->|start| CheckLocalStart{"local_instance_state?"}
+        CheckLocalStart -->|OCF_SUCCESS| ExecPAFStartRunning["$REAL_PAF start\n(идемпотентный запуск)\nВыход $?"]
+        CheckLocalStart -->|Ошибка / не confirmed| ErrStartForbidden["Запуск запрещен: статус неясен\nВыход: OCF_ERR_GENERIC (1)"]
+        CheckLocalStart -->|OCF_NOT_RUNNING| FindPrimary{"select_primary:\nПоиск активного Primary на пирах\n(pg_is_in_recovery == f)?"}
+
+        %% Нет Primary
+        FindPrimary -->|Не найден| CheckNeedResync{"Файл $NEED_RESYNC_FLAG\nсуществует?"}
+        CheckNeedResync -->|Да| ErrPrimaryLost["Ошибка: нужен resync, но Primary нет\nВыход: OCF_ERR_GENERIC (1)"]
+        CheckNeedResync -->|Нет| CheckLocalDataSanity{"Наличие PG_VERSION и\nglobal/pg_control локально?"}
+        CheckLocalDataSanity -->|Нет| ErrIncompletePGDATA["Ошибка: неполный PGDATA\nВыход: OCF_ERR_GENERIC (1)"]
+        CheckLocalDataSanity -->|Да| ExecPAFStartCold["Холодный старт кластера\n$REAL_PAF start\nВыход $?"]
+
+        %% Primary найден -> Восстановление
+        FindPrimary -->|Найден| RunPerformResync["Запуск perform_resync"]
+    end
+
+    %% Детализация процедуры восстановления perform_resync
+    subgraph SubPerformResync ["Процедура perform_resync"]
+        RunPerformResync --> VSource1["validate_source:\n- проверка system_identifier\n- отсутствие external tablespaces"]
+        VSource1 --> StopLocalStrict["stop_local: подтверждение остановки"]
+        StopLocalStrict --> MarkFlag["touch $NEED_RESYNC_FLAG"]
+        MarkFlag --> PreserveBranch["preserve_branch:\n1. Контроль свободного места (+10% + 64MB)\n2. tar c -> tar compare -> sha256sum\n3. Запись COMPLETE в $RESCUE_DIR"]
+        PreserveBranch --> PrepSourceSlot["prepare_source_slot:\nПроверка / пересоздание слота репликации на Primary"]
+        PrepSourceSlot --> TryRewind{"Запуск pg_rewind\n(таймаут REWIND_TIMEOUT_SEC)"}
+
+        %% Ветка Rewind
+        TryRewind -->|Успех| PostResyncConfig
+
+        %% Ветка Basebackup (Fallback при расхождении WAL)
+        TryRewind -->|Сбой / невозможно| RunBasebackup["pg_basebackup в каталог .staging.XXXXXX\n(-Xs, -Fp, -R, -S MY_SLOT)"]
+        RunBasebackup --> ValidateStaging["Проверка PG_VERSION, pg_control\nи совпадения system_identifier"]
+        ValidateStaging --> AtomicSwap["Атомарная подмена директорий:\n1. PGDATA -> .old.XXXXXX\n2. .staging.XXXXXX -> PGDATA"]
+        AtomicSwap --> PostResyncConfig["restore_local_auto_conf:\n1. Генерация postgresql.auto.conf\n(primary_conninfo, primary_slot_name)\n2. touch standby.signal (chown postgres)"]
+    end
+
+    PostResyncConfig --> CheckResyncSuccess{"Восстановление успешно?"}
+    CheckResyncSuccess -->|Нет| ErrResyncFailed["Ошибка resync: запуск отменен\nВыход: OCF_ERR_GENERIC (1)"]
+    CheckResyncSuccess -->|Да| ExecPAFStartAfterRecovery["Запуск восстановленного инстанса:\n$REAL_PAF start\nВыход $?"]
+
+    %% Ветка прочих действий
+    DispatchAction -->|demote / notify / reload| ExecPAFRemaining["$REAL_PAF $@\nВыход с кодом PAF"]

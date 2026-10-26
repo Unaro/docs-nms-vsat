@@ -1,0 +1,80 @@
+flowchart TD
+    Start(["Старт: запуск скрипта"]) --> CheckArgs{"Проверка аргумента $1"}
+
+    %% Валидация аргументов и окружения
+    CheckArgs -->|Неверный аргумент| ErrArgs["Ошибка использования: только [--init-pcs]\nexit 2"]
+    CheckArgs -->|Пусто или --init-pcs| CheckRoot{"EUID == 0 (root)?"}
+
+    CheckRoot -->|Нет| ErrRoot["Ошибка: требуются права root\nexit 1"]
+    CheckRoot -->|Да| CheckEnvFile{"Файл $ENV_FILE существует?"}
+
+    CheckEnvFile -->|Нет| ErrEnv["Ошибка: запустите generate-ha-config.sh\nexit 1"]
+    CheckEnvFile -->|Да| LoadEnv["source $ENV_FILE"]
+
+    LoadEnv --> ValidateParams{"Все обязательные сетевые параметры\nи имена нод заданы?"}
+    ValidateParams -->|Нет| ErrParams["Ошибка: параметр не задан\nexit 1"]
+    ValidateParams -->|Да| CheckHostname{"hostname -s совпадает\nс NODE1_NAME или NODE2_NAME?"}
+
+    CheckHostname -->|Нет| ErrHost["Ошибка: неизвестный узел\nexit 1"]
+    CheckHostname -->|Да| CheckReinit{"Аргумент --init-pcs И\ncorosync.conf уже существует?"}
+
+    CheckReinit -->|Да| ErrReinit["Ошибка: кластер уже настроен\nexit 1"]
+    CheckReinit -->|Нет| ValidateServices{"Имена служб в APP_SERVICE и\nDAEMON_SERVICE валидны (regex)?"}
+
+    ValidateServices -->|Нет| ErrServices["Ошибка: недопустимое имя службы\nexit 1"]
+    ValidateServices -->|Да| SetDefaults["Установка параметров по умолчанию\n(таймауты, порты, пути PGDATA/PGBIN)"]
+
+    %% Общая подготовка служб и артефактов на узле
+    subgraph SubArtifacts ["Подготовка окружения и systemd (общая для всех нод)"]
+        SetDefaults --> SourceLib["source lib/artifacts.sh"]
+        SourceLib --> InstallBin["Установка cluster-boot-analyzer.sh\nи cluster-degraded-unblock.sh в /usr/local/sbin/ (0755)"]
+        InstallBin --> RenderUnits["Рендеринг и установка systemd-юнитов:\n- cluster-boot-analyzer.service\n- cluster-degraded-unblock.service/.timer"]
+        RenderUnits --> InstallDropins["Установка drop-in конфигов для corosync и pacemaker:\n- ha-preflight.conf\n- ha-hardening.conf"]
+        InstallDropins --> ReloadSystemd["systemctl daemon-reload\nsystemctl enable pcsd.service\nsystemctl enable cluster-degraded-unblock.timer"]
+    end
+
+    %% Ветвление: Инициализация кластера или просто подготовка
+    ReloadSystemd --> BranchInit{"Передан флаг\n--init-pcs?"}
+
+    BranchInit -->|Нет| PreppedSuccess(["Узел подготовлен на уровне сервисов\nПредложение запустить --init-pcs на NODE1\nЗавершение"])
+
+    %% Ветка --init-pcs: Проверки перед инициализацией
+    subgraph SubInitChecks ["Проверки перед созданием кластера (--init-pcs)"]
+        BranchInit -->|Да| CheckNode1{"Запуск на узле NODE1_NAME?"}
+        CheckNode1 -->|Нет| ErrNotNode1["Ошибка: инициализацию запускать только на NODE1\nexit 1"]
+        CheckNode1 -->|Да| CheckCorosyncExists{"corosync.conf существует?"}
+        CheckCorosyncExists -->|Да| ErrCorosyncExists["Ошибка: кластер уже существует\nexit 1"]
+        CheckCorosyncExists -->|Нет| ValidateTimeouts{"Таймауты являются числами?"}
+        ValidateTimeouts -->|Нет| ErrTimeouts["Ошибка: недопустимый таймаут\nexit 1"]
+        ValidateTimeouts -->|Да| CheckOCFAgent{"OCF-агент pgsqlms-ha\nсуществует и исполняемый?"}
+        CheckOCFAgent -->|Нет| ErrNoAgent["Ошибка: установите pgsqlms-ha на обоих узлах\nexit 1"]
+    end
+
+    %% Настройка кластера Corosync
+    subgraph SubCorosyncSetup ["Инициализация Corosync"]
+        CheckOCFAgent -->|Да| AuthNodes["pcs host auth NODE1 NODE2\n(пользователь hacluster)"]
+        AuthNodes --> ClusterSetup["pcs cluster setup ha_cluster\n- Двойной Knet (Ring 0 / Ring 1)\n- Настройка Totem (token, consensus)"]
+        ClusterSetup --> QuorumWait["pcs quorum update wait_for_all=1"]
+        QuorumWait --> StartCluster["pcs cluster start --all\npcs cluster enable --all"]
+        StartCluster --> EnableMaint["pcs property set maintenance-mode=true"]
+    end
+
+    %% Настройка Pacemaker и создание ресурсов
+    subgraph SubPacemakerResources ["Конфигурация свойств и создание ресурсов"]
+        EnableMaint --> SetProps["Глобальные свойства:\n- stonith-enabled=false\n- no-quorum-policy=stop\n- defaults: migration-threshold=3, failure-timeout"]
+        SetProps --> CreatePing["Создание клонированного ресурса ping-gateway\n(ocf:pacemaker:ping к ROUTER_IPS)"]
+        CreatePing --> CreatePgsql["Создание pgsql (promotable clone)\n(ocf:heartbeat:pgsqlms-ha с расчетом таймаутов)"]
+        CreatePgsql --> CreateHAProxy["Создание haproxy-svc (clone)\n(systemd:haproxy)"]
+        CreateHAProxy --> CreateVIP["Создание группы app-stack:\n1. vip (ocf:heartbeat:IPaddr2)"]
+        CreateVIP --> CreateAppStack["2. Добавление app-${svc} в группу app-stack"]
+        CreateAppStack --> CreateDaemonStack["Создание daemon-${dsvc} (clone systemd)"]
+    end
+
+    %% Настройка ограничений
+    subgraph SubConstraints ["Ограничения размещения и порядка (Constraints)"]
+        CreateDaemonStack --> LocationRules["Правила размещения по пингу (pingd):\n- Запрет Master pgsql при потере сети\n- Запрет app-stack при потере сети"]
+        LocationRules --> OrderRules["Порядок запуска (Order):\n1. haproxy-svc-clone -> app-stack\n2. haproxy-svc-clone -> daemon-${dsvc}-clone"]
+    end
+
+    SubConstraints --> DisableMaint["pcs property set maintenance-mode=false"]
+    DisableMaint --> ClusterSuccess(["Кластер успешно инициализирован и запущен!\nЗавершение"])

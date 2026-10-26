@@ -182,30 +182,48 @@ if [[ "${1:-}" == "--init-pcs" ]]; then
       --group app-stack
   done
 
+  # Варинат 1: Один гуляющий демон
   # 7. Группа daemon-stack (фоновый демон записи)
+  # for dsvc in $DAEMON_SERVICE; do
+  #   dsvc_clean="${dsvc%.service}"
+  #   pcs resource create "daemon-${dsvc_clean}" "systemd:${dsvc_clean}" \
+  #     op start timeout=30s \
+  #     op stop timeout=30s \
+  #     op monitor interval=10s timeout=20s \
+  #     --group daemon-stack
+  # done
+
+  # Варинат 2: Клон на каждой ноде
   for dsvc in $DAEMON_SERVICE; do
     dsvc_clean="${dsvc%.service}"
     pcs resource create "daemon-${dsvc_clean}" "systemd:${dsvc_clean}" \
       op start timeout=30s \
       op stop timeout=30s \
       op monitor interval=10s timeout=20s \
-      --group daemon-stack
+      clone meta interleave=true
   done
 
   # ---------------------------------------------------------------------------
   # ОГРАНИЧЕНИЯ РАЗМЕЩЕНИЯ И ПОРЯДКА
   # ---------------------------------------------------------------------------
-  # Positive ping scores only prefer nodes; they do NOT ban disconnected nodes.
-  pcs constraint location pgsql-clone rule role=Promoted score=-INFINITY pingd not_defined
+  pcs constraint location pgsql-clone rule role=Promoted score=-INFINITY not_defined pingd
   pcs constraint location pgsql-clone rule role=Promoted score=-INFINITY pingd lte 0
-  pcs constraint location app-stack rule score=-INFINITY pingd not_defined
+  pcs constraint location app-stack rule score=-INFINITY not_defined pingd
   pcs constraint location app-stack rule score=-INFINITY pingd lte 0
+  
+  # Варинат 1: Один гуляющий демон
+  # pcs constraint order start haproxy-svc-clone then start app-stack
+  # if [[ -n ${DAEMON_SERVICE:-} ]]; then
+  #   pcs constraint order start haproxy-svc-clone then start daemon-stack
+  # fi
 
-  # Приложение и демон обращаются к БД через локальный HAProxy.
-  # Их размещение и жизненный цикл не зависят от роли PostgreSQL.
+  # Варинат 2: Клон на каждой ноде
   pcs constraint order start haproxy-svc-clone then start app-stack
   if [[ -n ${DAEMON_SERVICE:-} ]]; then
-    pcs constraint order start haproxy-svc-clone then start daemon-stack
+    for dsvc in $DAEMON_SERVICE; do
+      dsvc_clean="${dsvc%.service}"
+      pcs constraint order start haproxy-svc-clone then start "daemon-${dsvc_clean}-clone"
+    done
   fi
 
   # If any command above fails, maintenance remains enabled for operator inspection.

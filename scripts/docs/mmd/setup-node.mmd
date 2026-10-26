@@ -1,0 +1,107 @@
+flowchart TD
+    Start(["Старт: запуск скрипта"]) --> ParseArgs{"Проверка аргумента $1"}
+
+    %% Валидация аргументов
+    ParseArgs -->|--master| SetMaster["NODE_ROLE = MASTER"]
+    ParseArgs -->|--standby| SetStandby["NODE_ROLE = STANDBY"]
+    ParseArgs -->|--stop-master| SetStopMaster["NODE_ROLE = STOP_MASTER"]
+    ParseArgs -->|Иначе / пусто| ErrArgs["Вывод ошибки и справки\nexit 1"]
+
+    SetMaster --> CheckRoot{"EUID == 0 (root)?"}
+    SetStandby --> CheckRoot
+    SetStopMaster --> CheckRoot
+
+    %% Предварительные проверки
+    CheckRoot -->|Нет| ErrRoot["Ошибка: нужен root\nexit 1"]
+    CheckRoot -->|Да| CheckEnv{"Файл $ENV_FILE существует?"}
+
+    CheckEnv -->|Нет| ErrEnv["Ошибка: запустите configure-ha.sh\nexit 1"]
+    CheckEnv -->|Да| InitLogging["Перенаправление вывода в $LOG_FILE (tee)\nsource $ENV_FILE"]
+
+    InitLogging --> CheckCreds{"Проверка переводов строк\nв паролях и пользователях"}
+    CheckCreds -->|Есть переносы| ErrCreds["Ошибка: переводы строк в кредах\nexit 1"]
+    CheckCreds -->|Корректно| SourceArtifacts["source lib/artifacts.sh"]
+
+    SourceArtifacts --> CheckPGDATA{"Проверка безопасности пути PGDATA\n(абсолютный, не '/', не symlink)"}
+    CheckPGDATA -->|Небезопасен| ErrPGDATA["Ошибка: небезопасный путь PGDATA\nexit 1"]
+    CheckPGDATA -->|Корректен| CheckHostname{"hostname -s совпадает с\nожидаемым для роли (node1/node2)?"}
+
+    CheckHostname -->|Нет| ErrHost["Ошибка: неверный узел для роли\nexit 1"]
+    CheckHostname -->|Да| CheckEmptyPGDATA{"NODE_ROLE != STOP_MASTER и\nPGDATA существует и не пуст?"}
+
+    CheckEmptyPGDATA -->|Да| ErrNotEmpty["Ошибка: PGDATA должен быть пустым\nexit 1"]
+    CheckEmptyPGDATA -->|Нет| CheckPacemaker{"Pacemaker запущен\n(is-active)?"}
+
+    CheckPacemaker -->|Да| ErrPacemaker["Ошибка: Pacemaker активен\nexit 1"]
+    CheckPacemaker -->|Нет| BranchStopMaster{"NODE_ROLE == STOP_MASTER?"}
+
+    %% Ветка STOP_MASTER
+    subgraph SubStopMaster ["Режим STOP_MASTER"]
+        BranchStopMaster -->|Да| PgStopFast["pg_ctl stop -m fast (-w -t 60)"]
+        PgStopFast --> CheckStillRunning{"PostgreSQL всё ещё запущен?"}
+        CheckStillRunning -->|Да| PgStopImmediate["pg_ctl stop -m immediate (-w -t 30)"]
+        CheckStillRunning -->|Нет| CheckPgrep
+        PgStopImmediate --> CheckPgrep{"Процессы postgres остались\n(pgrep)?"}
+        CheckPgrep -->|Да| ErrStop["Ошибка остановки master\nexit 1"]
+        CheckPgrep -->|Нет| CreateStandbySignal["touch $PGDATA/standby.signal\nchown postgres:postgres"]
+        CreateStandbySignal --> ExitStopSuccess(["Выход: master остановлен\nexit 0"])
+    end
+
+    %% Общая предварительная настройка
+    subgraph SubCommonSetup ["Базовая настройка системы и окружения"]
+        BranchStopMaster -->|Нет| UpdateHosts["Очистка 127.0.1.1 и старых блоков в /etc/hosts\nРендеринг и добавление hosts.block.tpl"]
+        UpdateHosts --> ApplySysctl["Установка sysctl/99-ha-cluster.conf\nsysctl --system"]
+        ApplySysctl --> GenPgPass["Генерация ~/.pgpass (0600, postgres:postgres)\nУстановка пароля пользователя hacluster"]
+        GenPgPass --> InstallDbRoleCheck["Установка /usr/local/bin/db-role-check.sh (0755)"]
+        InstallDbRoleCheck --> SetupSocket["Рендеринг db-role-check.socket\nУстановка db-role-check@.service"]
+        SetupSocket --> ConfigHAProxy["Рендеринг haproxy.cfg\nПроверка синтаксиса: haproxy -c"]
+        ConfigHAProxy --> PrepareRunSocketDir["mkdir /var/run/postgresql (2775, postgres:postgres)"]
+        PrepareRunSocketDir --> StopSysServices["Остановка системных служб postgresql\nчерез systemctl"]
+    end
+
+    %% Ветвление MASTER vs STANDBY
+    StopSysServices --> CheckRoleMaster{"NODE_ROLE == MASTER?"}
+
+    %% Ветка MASTER
+    subgraph SubMaster ["Режим MASTER"]
+        CheckRoleMaster -->|Да| CheckMasterInit{"$PGDATA уже содержит файлы БД?"}
+        CheckMasterInit -->|Нет| InitDB["Создание PGDATA (0700)\ninitdb -k -E UTF8 --locale=C"]
+        CheckMasterInit -->|Да| CallConfPGMaster["Вызов configure_postgres_files"]
+        InitDB --> CallConfPGMaster
+        CallConfPGMaster --> ConfigAutoMaster["Рендеринг node1.auto.conf.tpl в\n$PGDATA/postgresql.auto.conf (0600)"]
+        ConfigAutoMaster --> StartTempMaster["Запуск временного PostgreSQL\n(pg_ctl start -p DB_PORT)"]
+        StartTempMaster --> CheckStartMaster{"Успешный запуск?"}
+        CheckStartMaster -->|Нет| ErrMasterStart["Ошибка запуска PostgreSQL\nexit 1"]
+        CheckStartMaster -->|Да| RunProvisionSQL["psql provision.sql:\nсоздание пользователя репликации и слотов"]
+    end
+
+    %% Ветка STANDBY
+    subgraph SubStandby ["Режим STANDBY"]
+        CheckRoleMaster -->|Нет| WaitMasterPort["Ожидание открытия $DB_PORT\nна NODE1_RING0_IP (30 попыток по 2 с)"]
+        WaitMasterPort --> CheckMasterPort{"Порт доступен?"}
+        CheckMasterPort -->|Нет| ErrStandbyConn["Ошибка: Master недоступен\nexit 1"]
+        CheckMasterPort -->|Да| RunBaseBackup["Создание каталога PGDATA\npg_basebackup с $REPL_SLOT_NODE2 (-R, -Xs)"]
+        RunBaseBackup --> CheckBaseBackupSuccess{"$PGDATA/PG_VERSION существует?"}
+        CheckBaseBackupSuccess -->|Нет| ErrBaseBackup["Ошибка: pg_basebackup не удался\nexit 1"]
+        CheckBaseBackupSuccess -->|Да| TouchStandbySignal["touch $PGDATA/standby.signal (если отсутствует)"]
+        TouchStandbySignal --> ConfigAutoStandby["Рендеринг node2.auto.conf.tpl в\n$PGDATA/postgresql.auto.conf"]
+        ConfigAutoStandby --> CallConfPGStandby["Вызов configure_postgres_files"]
+        CallConfPGStandby --> ChownStandbyPG["chown -R postgres:postgres $PGDATA\nchmod 0700 $PGDATA"]
+    end
+
+    %% Финализация и сервисы
+    subgraph SubFinalize ["Установка OCF-агента и фиксация systemd"]
+        RunProvisionSQL --> CheckOCFWrapper{"Файл pgsqlms-ha существует?"}
+        ChownStandbyPG --> CheckOCFWrapper
+        CheckOCFWrapper -->|Нет| ErrOCFNotFound["Ошибка: pgsqlms-ha не найден\nexit 1"]
+        CheckOCFWrapper -->|Да| InstallOCF["Установка в /usr/lib/ocf/resource.d/heartbeat/pgsqlms-ha (0755)"]
+        InstallOCF --> CheckPAFBase{"Базовый агент pgsqlms\nсуществует и исполняемый?"}
+        CheckPAFBase -->|Нет| ErrPAFNotFound["Ошибка: установите resource-agents-paf\nexit 1"]
+        CheckPAFBase -->|Да| ReloadSystemd["systemctl daemon-reload"]
+        ReloadSystemd --> DisableServices["systemctl disable postgresql, haproxy"]
+        DisableServices --> CheckStopServices{"NODE_ROLE != MASTER?"}
+        CheckStopServices -->|Да| StopServices["systemctl stop postgresql, haproxy"]
+        CheckStopServices -->|Нет| EnableSockets["systemctl enable --now\ndb-role-check.socket, pcsd.service"]
+        StopServices --> EnableSockets
+        EnableSockets --> SuccessEnd(["Узел успешно настроен!\nexit 0"])
+    end

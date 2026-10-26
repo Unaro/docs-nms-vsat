@@ -1,0 +1,57 @@
+flowchart TD
+    Start(["Старт: cluster-boot-analyzer.sh"]) --> LoadEnv["Загрузка конфигурации из /etc/default/ha-cluster"]
+    LoadEnv --> CheckNode{"hostname -s совпадает с\nNODE1_NAME или NODE2_NAME?"}
+
+    CheckNode -->|Нет| ErrNode["Ошибка: неизвестный узел\nexit 1"]
+    CheckNode -->|Да| CheckFS{"Проверка FS для PGDATA:\nСвободное место и inodes >= MIN_FREE_DISK_PCT (5%)?"}
+
+    CheckFS -->|Нет| ErrFS["Ошибка: недостаточно места или inodes\nexit 1"]
+    CheckFS -->|Да| ReadState["Чтение состояния кластера через pg_controldata\n(поле 'Database cluster state')"]
+
+    ReadState --> CheckRunning{"PostgreSQL уже запущен\n(pg_ctl status)?"}
+
+    %% Ветка Crash Recovery
+    subgraph SubCrashRecovery ["Crash Recovery (изолированное восстановление)"]
+        CheckRunning -->|Нет| CheckDirtyState{"Состояние 'in production'\nили 'in archive recovery'?"}
+        CheckDirtyState -->|Да| MarkCrashed["was_crashed = 1"]
+        MarkCrashed --> StartIsolated["Изолированный запуск pg_ctl start\n(-c listen_addresses='' -p $DB_PORT)"]
+        StartIsolated --> CheckStartOk{"Успешный запуск?"}
+        CheckStartOk -->|Нет| ErrStart["Ошибка наката WAL\nexit 1"]
+        CheckStartOk -->|Да| StopFast["Остановка pg_ctl stop -m fast\n(фиксация чистой контрольной точки)"]
+        StopFast --> CheckStopOk{"Успешная остановка?"}
+        CheckStopOk -->|Нет| ErrStop["Ошибка остановки после recovery\nexit 1"]
+        CheckStopOk -->|Да| RereadState["Повторное чтение состояния\nчерез pg_controldata"]
+    end
+
+    CheckRunning -->|Да| SkipRecovery["Логирование: PostgreSQL запущен,\nпропуск локального Crash Recovery"]
+    CheckDirtyState -->|Нет| SkipRecovery
+
+    %% Определение роли и таймаута
+    subgraph SubRoleMode ["Классификация роли и режима запуска"]
+        RereadState --> ClassifyRole
+        SkipRecovery --> ClassifyRole{"Определение роли по состоянию"}
+        ClassifyRole -->|'shut down' / 'in production'| RoleMaster["role = MASTER"]
+        ClassifyRole -->|'*recovery*'| RoleSlave["role = SLAVE"]
+        RoleMaster --> CheckSignal{"Файл standby.signal\nсуществует?"}
+        RoleSlave --> CheckSignal
+        CheckSignal -->|Да| ForceSlave["role = SLAVE"]
+        CheckSignal -->|Нет| EvalMode
+        ForceSlave --> EvalMode
+
+        EvalMode{"was_crashed == 1?"}
+        EvalMode -->|Да| ModeCrashApplied["mode = CRASH_RECOVERY_APPLIED\ndelay = CRASH_TIMEOUT_SEC (900s)"]
+        EvalMode -->|Нет| CheckClean{"Состояние 'shut down'\nили 'shut down in recovery'?"}
+        CheckClean -->|Да| ModeColdStart["mode = COLD_START\ndelay = COLD_START_TIMEOUT_SEC (180s)"]
+        CheckClean -->|Нет| ModeCrashRecovery["mode = CRASH_RECOVERY\ndelay = CRASH_TIMEOUT_SEC (900s)"]
+    end
+
+    %% Атомарная запись состояния
+    subgraph SubSaveBootMode ["Сохранение режима загрузки"]
+        ModeCrashApplied --> ValidateDelay{"delay валидный И\nBOOT_MODE_FILE абсолютный?"}
+        ModeColdStart --> ValidateDelay
+        ModeCrashRecovery --> ValidateDelay
+        ValidateDelay -->|Нет| ErrDelay["Ошибка валидации параметров\nexit 1"]
+        ValidateDelay -->|Да| WriteAtomic["Атомарная запись в $BOOT_MODE_FILE через mktemp:\n- MODE\n- LAST_ROLE\n- UNBLOCK_TIMEOUT_SEC"]
+    end
+
+    WriteAtomic --> FinishSuccess(["Завершение проверки с кодом 0"])

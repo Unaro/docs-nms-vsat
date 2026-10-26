@@ -1,0 +1,1018 @@
+#!/bin/bash
+#
+# OCF wrapper for PAF.
+#
+# The original PAF agent is NOT modified.
+# Preserve the stopped branch BEFORE changing its contents.
+#
+# Physical archives are evidence/recovery sources.
+# They are not automatically mergeable SQL backups.
+#
+# Requirements inherited from this implementation:
+#   - PostgreSQL 13 or newer;
+#   - operating-system user postgres;
+#   - local socket directory /var/run/postgresql;
+#   - pgdata == datadir;
+#   - no symlinks/external tablespaces inside the local PGDATA;
+#   - no external tablespaces on the basebackup source;
+#   - PostgreSQL is managed exclusively by Pacemaker;
+#   - working fencing/quorum configuration.
+#
+# Do NOT enable "set -e": several OCF/PostgreSQL return codes are expected.
+
+set -o pipefail
+
+REAL_PAF=/usr/lib/ocf/resource.d/heartbeat/pgsqlms
+ENV_FILE=/etc/default/ha-cluster
+
+export LC_ALL=C
+export OCF_ROOT="${OCF_ROOT:-/usr/lib/ocf}"
+
+if [[ -f "$OCF_ROOT/lib/heartbeat/ocf-shellfuncs" ]]; then
+    # shellcheck disable=SC1090
+    . "$OCF_ROOT/lib/heartbeat/ocf-shellfuncs"
+else
+    ocf_log() {
+        local level=$1
+        shift
+        logger -t pgsqlms-ha -p "daemon.$level" -- "$*"
+    }
+fi
+
+OCF_SUCCESS=0
+OCF_ERR_GENERIC=1
+OCF_ERR_INSTALLED=5
+OCF_ERR_CONFIGURED=6
+OCF_NOT_RUNNING=7
+OCF_RUNNING_MASTER=8
+
+if [[ ! -x "$REAL_PAF" ]]; then
+    ocf_log err "Не найден базовый агент PAF: $REAL_PAF"
+    exit "$OCF_ERR_INSTALLED"
+fi
+
+# Metadata must not depend on the local database/configuration
+# and must not create service directories.
+if [[ ${1:-} == meta-data ]]; then
+    "$REAL_PAF" meta-data |
+        sed 's/name="pgsqlms"/name="pgsqlms-ha"/'
+    exit $?
+fi
+
+# ENV_FILE is sourced as shell code, so it must be trusted.
+if [[ ! -f "$ENV_FILE" ||
+      $(stat -c %u "$ENV_FILE") != 0 ]] ||
+   [[ -n $(find "$ENV_FILE" -maxdepth 0 -perm /022 -print 2>/dev/null) ]]; then
+    ocf_log err \
+        "Файл конфигурации должен принадлежать root и быть недоступным для записи группе и остальным: $ENV_FILE"
+    exit "$OCF_ERR_CONFIGURED"
+fi
+
+# shellcheck disable=SC1090
+source "$ENV_FILE" || {
+    ocf_log err "Не удалось прочитать конфигурацию: $ENV_FILE"
+    exit "$OCF_ERR_CONFIGURED"
+}
+
+# These variables must be provided by ENV_FILE.
+for variable in \
+    NODE1_NAME NODE2_NAME \
+    NODE1_RING0_IP NODE1_RING1_IP \
+    NODE2_RING0_IP NODE2_RING1_IP \
+    REPL_SLOT_NODE1 REPL_SLOT_NODE2 \
+    PGDATA PGBIN DB_PORT REPL_USER PGPASS_FILE
+do
+    if [[ -z ${!variable} ]]; then
+        ocf_log err "Не задана переменная $variable в $ENV_FILE"
+        exit "$OCF_ERR_CONFIGURED"
+    fi
+done
+
+if [[ $NODE1_NAME == "$NODE2_NAME" ]]; then
+    ocf_log err 'NODE1_NAME и NODE2_NAME должны различаться'
+    exit "$OCF_ERR_CONFIGURED"
+fi
+
+MY_HOSTNAME=$(hostname -s) || exit "$OCF_ERR_GENERIC"
+
+case "$MY_HOSTNAME" in
+    "$NODE1_NAME")
+        MY_SLOT=$REPL_SLOT_NODE1
+        PEER_R0_IP=$NODE2_RING0_IP
+        PEER_R1_IP=$NODE2_RING1_IP
+        ;;
+    "$NODE2_NAME")
+        MY_SLOT=$REPL_SLOT_NODE2
+        PEER_R0_IP=$NODE1_RING0_IP
+        PEER_R1_IP=$NODE1_RING1_IP
+        ;;
+    *)
+        ocf_log err "Неизвестный узел: $MY_HOSTNAME"
+        exit "$OCF_ERR_CONFIGURED"
+        ;;
+esac
+
+STATE_DIR=/var/lib/postgresql/pcmk_state
+RESCUE_DIR=${RESCUE_DIR:-/var/lib/postgresql/tail_backups}
+
+GRACE_PERIOD_SEC=${GRACE_PERIOD_SEC:-30}
+BASEBACKUP_TIMEOUT_SEC=${BASEBACKUP_TIMEOUT_SEC:-540}
+REWIND_TIMEOUT_SEC=${REWIND_TIMEOUT_SEC:-180}
+TAIL_BACKUP_TIMEOUT_SEC=${TAIL_BACKUP_TIMEOUT_SEC:-900}
+PG_STOP_TIMEOUT_SEC=${PG_STOP_TIMEOUT_SEC:-60}
+SQL_TIMEOUT_SEC=${SQL_TIMEOUT_SEC:-3}
+
+for value in \
+    "$GRACE_PERIOD_SEC" \
+    "$BASEBACKUP_TIMEOUT_SEC" \
+    "$REWIND_TIMEOUT_SEC" \
+    "$TAIL_BACKUP_TIMEOUT_SEC" \
+    "$PG_STOP_TIMEOUT_SEC" \
+    "$SQL_TIMEOUT_SEC"
+do
+    if [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
+        ocf_log err \
+            'Таймауты должны быть положительными целыми числами секунд'
+        exit "$OCF_ERR_CONFIGURED"
+    fi
+done
+
+if [[ ! $DB_PORT =~ ^[1-9][0-9]{0,4}$ ]] ||
+   (( DB_PORT > 65535 )); then
+    ocf_log err "Некорректный DB_PORT: $DB_PORT"
+    exit "$OCF_ERR_CONFIGURED"
+fi
+
+for slot in "$REPL_SLOT_NODE1" "$REPL_SLOT_NODE2"; do
+    if [[ ! $slot =~ ^[a-z0-9_]+$ || ${#slot} -gt 63 ]]; then
+        ocf_log err "Некорректное имя replication slot: $slot"
+        exit "$OCF_ERR_CONFIGURED"
+    fi
+done
+
+if [[ $REPL_SLOT_NODE1 == "$REPL_SLOT_NODE2" ]]; then
+    ocf_log err 'Для двух узлов должны использоваться разные слоты'
+    exit "$OCF_ERR_CONFIGURED"
+fi
+
+# Connection strings below use simple, unquoted libpq values.
+# Reject characters that would require additional libpq escaping.
+if [[ ! $REPL_USER =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ||
+      ! $MY_HOSTNAME =~ ^[a-zA-Z0-9_.-]+$ ||
+      ! $PEER_R0_IP =~ ^[a-zA-Z0-9_.:-]+$ ||
+      ! $PEER_R1_IP =~ ^[a-zA-Z0-9_.:-]+$ ||
+      ! $PGPASS_FILE =~ ^/[a-zA-Z0-9_./-]+$ ]]; then
+    ocf_log err \
+        'Неподдерживаемые символы в REPL_USER, имени узла, адресах или PGPASS_FILE'
+    exit "$OCF_ERR_CONFIGURED"
+fi
+
+if [[ $PGBIN != /* ||
+      $PGDATA != /* ||
+      $PGDATA == / ||
+      $PGDATA == */ ||
+      -L $PGDATA ||
+      $RESCUE_DIR != /* ]]; then
+    ocf_log err 'Небезопасный путь PGDATA, PGBIN или RESCUE_DIR'
+    exit "$OCF_ERR_CONFIGURED"
+fi
+
+# Reject path aliases that could put archives/service files inside PGDATA.
+PGDATA=$(realpath -m -- "$PGDATA") ||
+    exit "$OCF_ERR_CONFIGURED"
+
+RESCUE_DIR=$(realpath -m -- "$RESCUE_DIR") ||
+    exit "$OCF_ERR_CONFIGURED"
+
+STATE_DIR=$(realpath -m -- "$STATE_DIR") ||
+    exit "$OCF_ERR_CONFIGURED"
+
+if [[ $PGDATA == / ||
+      $RESCUE_DIR == / ||
+      $RESCUE_DIR == "$PGDATA" ||
+      $RESCUE_DIR == "$PGDATA/"* ||
+      $STATE_DIR == "$PGDATA" ||
+      $STATE_DIR == "$PGDATA/"* ]]; then
+    ocf_log err 'STATE_DIR и RESCUE_DIR должны находиться вне PGDATA'
+    exit "$OCF_ERR_CONFIGURED"
+fi
+
+NO_STREAM_TS_FILE=$STATE_DIR/no_stream.ts
+NEED_RESYNC_FLAG=$STATE_DIR/need_resync.flag
+
+# PAF and the wrapper must address exactly the same instance.
+# This wrapper intentionally supports only pgdata == datadir.
+if [[ ${OCF_RESKEY_pgdata:-$PGDATA} != "$PGDATA" ||
+      ${OCF_RESKEY_datadir:-$PGDATA} != "$PGDATA" ||
+      ${OCF_RESKEY_bindir:-$PGBIN} != "$PGBIN" ||
+      ${OCF_RESKEY_pgport:-$DB_PORT} != "$DB_PORT" ||
+      ${OCF_RESKEY_system_user:-postgres} != postgres ||
+      ${OCF_RESKEY_pghost:-/var/run/postgresql} != /var/run/postgresql ]]; then
+    ocf_log err \
+        "Параметры OCF не соответствуют конфигурации wrapper в $ENV_FILE"
+    exit "$OCF_ERR_CONFIGURED"
+fi
+
+# Defaults must actually be passed to the original agent,
+# not merely used for comparison above.
+export OCF_RESKEY_pgdata="$PGDATA"
+export OCF_RESKEY_datadir="$PGDATA"
+export OCF_RESKEY_bindir="$PGBIN"
+export OCF_RESKEY_pgport="$DB_PORT"
+export OCF_RESKEY_system_user=postgres
+export OCF_RESKEY_pghost=/var/run/postgresql
+
+run_as_pg() {
+    runuser -u postgres -- env \
+        LC_ALL=C \
+        PGPASSFILE="$PGPASS_FILE" \
+        PGCONNECT_TIMEOUT=2 \
+        PATH="$PGBIN:/usr/bin:/bin" \
+        "$@"
+}
+
+psql_local() {
+    timeout --kill-after=2s "${SQL_TIMEOUT_SEC}s" \
+        runuser -u postgres -- env \
+        PGCONNECT_TIMEOUT=2 \
+        PGOPTIONS='-c statement_timeout=2000' \
+        "$PGBIN/psql" \
+        -X -w -qAt \
+        -v ON_ERROR_STOP=1 \
+        -h /var/run/postgresql \
+        -p "$DB_PORT" \
+        -d postgres \
+        -c "$1"
+}
+
+
+psql_at() {
+    local ip=$1
+    local sql=$2
+
+    timeout --kill-after=2s "${SQL_TIMEOUT_SEC}s" \
+        runuser -u postgres -- env \
+        PGPASSFILE="$PGPASS_FILE" \
+        PGCONNECT_TIMEOUT=2 \
+        PGOPTIONS='-c statement_timeout=2000' \
+        "$PGBIN/psql" \
+        -X -w -qAt \
+        -v ON_ERROR_STOP=1 \
+        -h "$ip" \
+        -p "$DB_PORT" \
+        -U "$REPL_USER" \
+        -d postgres \
+        -c "$sql"
+}
+
+# Resolve once, then pin recovery queries/tools to this address.
+#
+# This detects PostgreSQL's SQL role, not cluster authority.
+# Correct fencing and Pacemaker configuration remain mandatory.
+select_primary() {
+    local ip state
+
+    ACTIVE_PEER_IP=''
+
+    for ip in "$PEER_R0_IP" "$PEER_R1_IP"; do
+        state=$(psql_at "$ip" \
+            'SELECT pg_is_in_recovery();' 2>/dev/null) || continue
+
+        if [[ $state == f ]]; then
+            ACTIVE_PEER_IP=$ip
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+psql_peer() {
+    [[ -n ${ACTIVE_PEER_IP:-} ]] || return 1
+    psql_at "$ACTIVE_PEER_IP" "$1"
+}
+
+log_recovery() {
+    ocf_log info "$*"
+    printf '[%s] %s\n' "$(date -Is)" "$*" \
+        >> "$RESCUE_DIR/tail_recovery.log"
+}
+
+# Return codes:
+#   0: pg_ctl sees a running instance;
+#   7: stopped state confirmed;
+#   1: state is ambiguous or could not be determined.
+#
+# Never change PGDATA or remove postmaster.pid here.
+local_instance_state() {
+    local rc pid
+
+    if [[ ! -x "$PGBIN/pg_ctl" ]]; then
+        ocf_log err "Не найден pg_ctl: $PGBIN/pg_ctl"
+        return "$OCF_ERR_GENERIC"
+    fi
+
+    if [[ ! -d $PGDATA ]]; then
+        ocf_log err \
+            "PGDATA отсутствует или недоступен; проверьте файловую систему: $PGDATA"
+        return "$OCF_ERR_GENERIC"
+    fi
+
+    run_as_pg "$PGBIN/pg_ctl" -D "$PGDATA" status \
+        >/dev/null 2>&1
+    rc=$?
+
+    case "$rc" in
+        0)
+            return "$OCF_SUCCESS"
+            ;;
+        3)
+            # Be conservative if a PID file remains.
+            if [[ -e $PGDATA/postmaster.pid ]]; then
+                if [[ ! -f $PGDATA/postmaster.pid ||
+                      ! -r $PGDATA/postmaster.pid ]]; then
+                    ocf_log err \
+                        'Невозможно безопасно прочитать postmaster.pid'
+                    return "$OCF_ERR_GENERIC"
+                fi
+
+                IFS= read -r pid < "$PGDATA/postmaster.pid" || {
+                    ocf_log err 'Не удалось прочитать PID PostgreSQL'
+                    return "$OCF_ERR_GENERIC"
+                }
+
+                if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then
+                    ocf_log err \
+                        'Некорректный PID в postmaster.pid; требуется проверка оператором'
+                    return "$OCF_ERR_GENERIC"
+                fi
+
+                if kill -0 "$pid" 2>/dev/null; then
+                    ocf_log err \
+                        "PID $pid существует, хотя pg_ctl сообщает stopped; автоматическое восстановление запрещено"
+                    return "$OCF_ERR_GENERIC"
+                fi
+            fi
+
+            return "$OCF_NOT_RUNNING"
+            ;;
+        *)
+            # In particular, rc=4 is NOT confirmed stopped.
+            ocf_log err \
+                "pg_ctl status вернул $rc; остановка PostgreSQL не подтверждена"
+            return "$OCF_ERR_GENERIC"
+            ;;
+    esac
+}
+
+ensure_slots_on_master() {
+    psql_local "
+    SELECT pg_create_physical_replication_slot(s.name, true)
+    FROM unnest(ARRAY['$REPL_SLOT_NODE1', '$REPL_SLOT_NODE2']) AS s(name)
+    WHERE NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_replication_slots r
+        WHERE r.slot_name = s.name AND r.slot_type = 'physical'
+    );" >/dev/null
+}
+
+stop_local() {
+    local rc
+
+    local_instance_state
+    rc=$?
+
+    case "$rc" in
+        "$OCF_NOT_RUNNING")
+            return 0
+            ;;
+        "$OCF_SUCCESS")
+            timeout --kill-after=5s \
+                "$((PG_STOP_TIMEOUT_SEC + 5))s" \
+                sudo -u postgres \
+                "$PGBIN/pg_ctl" \
+                -D "$PGDATA" \
+                -m fast \
+                -w \
+                -t "$PG_STOP_TIMEOUT_SEC" \
+                stop || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    local_instance_state
+    rc=$?
+
+    [[ $rc == "$OCF_NOT_RUNNING" ]]
+}
+
+# No automatic pruning.
+# Archive the entire stopped source, including pg_wal.
+#
+# Symlinks, external WAL and external tablespaces are deliberately
+# rejected until explicit snapshot/mapping support is implemented.
+preserve_branch() {
+    local dest link required available
+
+    [[ -d $PGDATA &&
+       -f $PGDATA/global/pg_control ]] || return 1
+
+    link=$(find "$PGDATA" -type l -print -quit) || return 1
+
+    if [[ -n $link ]]; then
+        ocf_log err \
+            "Для внешних данных или символических ссылок требуется снимок, подготовленный оператором: $link"
+        return 1
+    fi
+
+    required=$(du -sb -- "$PGDATA" | awk '{print $1}') ||
+        return 1
+
+    available=$(
+        df -B1 --output=avail "$RESCUE_DIR" |
+            tail -1 |
+            tr -d ' '
+    ) || return 1
+
+    if [[ ! $required =~ ^[0-9]+$ ||
+          ! $available =~ ^[0-9]+$ ]] ||
+       (( available < required + required / 10 + 67108864 )); then
+        ocf_log err \
+            'Недостаточно места для архива с запасом 10% и 64 МиБ'
+        return 1
+    fi
+
+    dest=$(mktemp -d \
+        "$RESCUE_DIR/branch_${MY_HOSTNAME}_$(date +%Y%m%dT%H%M%S)_XXXXXX") ||
+        return 1
+
+    chmod 0700 "$dest" || return 1
+
+    # COMPLETE appears only after comparison, checksumming and syncing.
+    # Partial archives are retained.
+    if ! timeout --kill-after=5s "${TAIL_BACKUP_TIMEOUT_SEC}s" \
+        bash -c '
+            set -euo pipefail
+
+            src=$1
+            dest=$2
+
+            tar --create \
+                --file="$dest/pgdata.tar" \
+                --directory="$src" .
+
+            tar --compare \
+                --file="$dest/pgdata.tar" \
+                --directory="$src"
+
+            cd "$dest"
+
+            sha256sum pgdata.tar > SHA256SUMS
+            sha256sum --check SHA256SUMS
+
+            sync -f pgdata.tar
+            sync -f SHA256SUMS
+
+            printf "source=%s\ncreated=%s\n" \
+                "$src" "$(date -Is)" > COMPLETE
+
+            sync -f .
+        ' bash "$PGDATA" "$dest" \
+        >> "$dest/backup.log" 2>&1
+    then
+        ocf_log err \
+            "Не удалось сохранить ветку; восстановление запрещено. Незавершённый архив: $dest"
+        return 1
+    fi
+
+    log_recovery \
+        "Физический архив ветки создан и проверен: $dest"
+}
+
+restore_local_auto_conf() {
+    local temp conninfo rc
+
+    temp=$(mktemp "$PGDATA/.auto.conf.XXXXXX") || return 1
+
+    conninfo="host=${PEER_R0_IP},${PEER_R1_IP}"
+    conninfo+=" port=${DB_PORT}"
+    conninfo+=" user=${REPL_USER}"
+    conninfo+=" passfile=${PGPASS_FILE}"
+    conninfo+=" application_name=${MY_HOSTNAME}"
+    conninfo+=" connect_timeout=2"
+    conninfo+=" target_session_attrs=read-write"
+
+    # Escape as a PostgreSQL configuration string.
+    conninfo=${conninfo//\\/\\\\}
+    conninfo=${conninfo//\'/\'\'}
+
+    if [[ -f $PGDATA/postgresql.auto.conf ]]; then
+        grep -Ev \
+            '^[[:space:]]*(primary_conninfo|primary_slot_name|recovery_target_timeline)[[:space:]]*=' \
+            "$PGDATA/postgresql.auto.conf" > "$temp"
+        rc=$?
+
+        if (( rc > 1 )); then
+            rm -f "$temp"
+            return 1
+        fi
+    fi
+
+    if ! printf \
+        "primary_conninfo = '%s'\nprimary_slot_name = '%s'\nrecovery_target_timeline = 'latest'\n" \
+        "$conninfo" "$MY_SLOT" >> "$temp"
+    then
+        rm -f "$temp"
+        return 1
+    fi
+
+    chown postgres:postgres "$temp" &&
+        chmod 0600 "$temp" &&
+        mv -f "$temp" "$PGDATA/postgresql.auto.conf" ||
+        return 1
+
+    rm -f "$PGDATA/recovery.signal" || return 1
+
+    touch "$PGDATA/standby.signal" &&
+        chown postgres:postgres "$PGDATA/standby.signal"
+}
+
+validate_source() {
+    local remote_id local_id ctrl
+
+    [[ $(psql_peer 'SELECT pg_is_in_recovery();') == f ]] ||
+        return 1
+
+    remote_id=$(psql_peer \
+        'SELECT system_identifier FROM pg_control_system();') ||
+        return 1
+
+    [[ $remote_id =~ ^[0-9]+$ ]] || return 1
+
+    if [[ -n ${EXPECTED_SOURCE_ID:-} &&
+          $remote_id != "$EXPECTED_SOURCE_ID" ]]; then
+        ocf_log err \
+            'Идентификатор источника изменился во время восстановления'
+        return 1
+    fi
+
+    EXPECTED_SOURCE_ID=$remote_id
+
+    # Plain basebackup can write to original external tablespace paths.
+    # Refuse those without explicit -T mappings and volume snapshots.
+    if [[ $(psql_peer \
+        "SELECT count(*)
+           FROM pg_tablespace
+          WHERE pg_tablespace_location(oid) <> '';") != 0 ]]; then
+        ocf_log err \
+            'Для внешних табличных пространств источника требуется явное отображение путей'
+        return 1
+    fi
+
+    if [[ ${1:-} != source-only &&
+          -f $PGDATA/global/pg_control ]]; then
+        ctrl=$(run_as_pg \
+            "$PGBIN/pg_controldata" -D "$PGDATA") ||
+            return 1
+
+        local_id=$(
+            awk -F: \
+                '/Database system identifier/ {
+                    gsub(/[[:space:]]/, "", $2)
+                    print $2
+                }' <<< "$ctrl"
+        )
+
+        if [[ $local_id != "$remote_id" ]]; then
+            ocf_log err \
+                'system_identifier источника не совпадает с локальным'
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Distinguish an absent slot from an existing slot with NULL wal_status.
+# An active slot is not dropped or reused automatically.
+prepare_source_slot() {
+    local row slot_type active wal_status
+
+    row=$(psql_peer \
+        "SELECT slot_type, active, COALESCE(wal_status, 'null')
+           FROM pg_replication_slots
+          WHERE slot_name='$MY_SLOT';") ||
+        return 1
+
+    if [[ -n $row ]]; then
+        IFS='|' read -r slot_type active wal_status <<< "$row"
+
+        if [[ $slot_type != physical ]]; then
+            ocf_log err \
+                "Слот $MY_SLOT существует, но не является физическим"
+            return 1
+        fi
+
+        if [[ $active != f ]]; then
+            ocf_log err \
+                "Слот $MY_SLOT занят; автоматическое восстановление запрещено"
+            return 1
+        fi
+
+        if [[ $wal_status == lost ]]; then
+            psql_peer \
+                "SELECT pg_drop_replication_slot('$MY_SLOT');" \
+                >/dev/null || return 1
+
+            row=''
+        fi
+    fi
+
+    if [[ -z $row ]]; then
+        psql_peer \
+            "SELECT pg_create_physical_replication_slot('$MY_SLOT', true);" \
+            >/dev/null || return 1
+    fi
+}
+
+perform_resync() {
+    local rewind_ok=0
+    local staging_dir old_dir staging_ctrl staging_id
+
+    # Bash dynamic scoping makes this available to validate_source().
+    local EXPECTED_SOURCE_ID=''
+
+    validate_source || return 1
+    stop_local || return 1
+
+    touch "$NEED_RESYNC_FLAG" || return 1
+
+    # No pg_rewind/basebackup target changes before preservation.
+    preserve_branch || return 1
+
+    prepare_source_slot || return 1
+
+    if [[ -f $PGDATA/global/pg_control ]]; then
+        log_recovery \
+            "Запускается pg_rewind с источника $ACTIVE_PEER_IP" ||
+            return 1
+
+        if timeout --kill-after=5s "${REWIND_TIMEOUT_SEC}s" \
+            sudo -u postgres env \
+            LC_ALL=C \
+            PGPASSFILE="$PGPASS_FILE" \
+            "$PGBIN/pg_rewind" \
+            --target-pgdata="$PGDATA" \
+            --source-server="host=$ACTIVE_PEER_IP port=$DB_PORT user=$REPL_USER dbname=postgres passfile=$PGPASS_FILE connect_timeout=2 target_session_attrs=read-write"
+        then
+            rewind_ok=1
+        fi
+    fi
+
+    if [[ $rewind_ok == 0 ]]; then
+        # pg_rewind may already have changed the target.
+        # Validate only the source at this stage.
+        validate_source source-only || return 1
+
+        staging_dir=$(mktemp -d "${PGDATA}.staging.XXXXXX") ||
+            return 1
+
+        chown postgres:postgres "$staging_dir" &&
+            chmod 0700 "$staging_dir" ||
+            return 1
+
+        log_recovery \
+            "Запускается pg_basebackup в каталог $staging_dir" ||
+            return 1
+
+        if ! timeout --kill-after=5s "${BASEBACKUP_TIMEOUT_SEC}s" \
+            sudo -u postgres env \
+            PGPASSFILE="$PGPASS_FILE" \
+            PGCONNECT_TIMEOUT=2 \
+            "$PGBIN/pg_basebackup" \
+            -h "$ACTIVE_PEER_IP" \
+            -p "$DB_PORT" \
+            -U "$REPL_USER" \
+            -w \
+            -D "$staging_dir" \
+            -Fp \
+            -Xs \
+            -R \
+            -S "$MY_SLOT"
+        then
+            ocf_log err \
+                "Ошибка или таймаут pg_basebackup; временный каталог сохранён: $staging_dir"
+            return 1
+        fi
+
+        validate_source source-only || return 1
+
+        [[ -f $staging_dir/global/pg_control &&
+           -f $staging_dir/PG_VERSION ]] || return 1
+
+        staging_ctrl=$(run_as_pg \
+            "$PGBIN/pg_controldata" -D "$staging_dir") ||
+            return 1
+
+        staging_id=$(
+            awk -F: \
+                '/Database system identifier/ {
+                    gsub(/[[:space:]]/, "", $2)
+                    print $2
+                }' <<< "$staging_ctrl"
+        )
+
+        if [[ $staging_id != "$EXPECTED_SOURCE_ID" ]]; then
+            ocf_log err \
+                'system_identifier подготовленного basebackup не совпадает с источником'
+            return 1
+        fi
+
+        sync -f "$staging_dir" || return 1
+
+        old_dir=$(mktemp -d "${PGDATA}.old.XXXXXX") ||
+            return 1
+
+        rmdir "$old_dir" || return 1
+
+        mv -T "$PGDATA" "$old_dir" || return 1
+
+        if ! mv -T "$staging_dir" "$PGDATA"; then
+            mv -T "$old_dir" "$PGDATA" ||
+                ocf_log err \
+                    "ОШИБКА ОТКАТА: прежний каталог сохранён по пути $old_dir"
+            return 1
+        fi
+
+        log_recovery \
+            "PGDATA заменён; прежний каталог сохранён: $old_dir" ||
+            return 1
+    fi
+
+    # Recheck the pinned source before enabling standby startup.
+    validate_source source-only || return 1
+
+    restore_local_auto_conf || return 1
+
+    log_recovery \
+        'Подготовка реплики завершена; ожидаются запуск PAF и подтверждение потоковой репликации'
+}
+
+# Return 0 only when monitor should report an error to request recovery.
+# Return 1 means no recovery request from this helper.
+check_divergence_running() {
+    local status now first
+
+    status=$(psql_local \
+        'SELECT status FROM pg_stat_wal_receiver;') ||
+        return 1
+
+    if [[ $status == streaming ]]; then
+        if [[ -f $NEED_RESYNC_FLAG ]]; then
+            log_recovery \
+                'Потоковая репликация после восстановления подтверждена' ||
+                return 1
+        fi
+
+        if ! rm -f "$NO_STREAM_TS_FILE" "$NEED_RESYNC_FLAG"; then
+            ocf_log err \
+                'Streaming работает, но не удалось удалить служебные маркеры'
+        fi
+
+        return 1
+    fi
+
+    select_primary || return 1
+
+    now=$(date +%s) || return 1
+
+    if [[ ! -f $NO_STREAM_TS_FILE ]]; then
+        printf '%s\n' "$now" > "$NO_STREAM_TS_FILE" || return 1
+        return 1
+    fi
+
+    first=$(< "$NO_STREAM_TS_FILE")
+
+    if [[ ! $first =~ ^[0-9]+$ ]]; then
+        ocf_log warn \
+            'Некорректный таймер отсутствия streaming; отсчёт начинается заново'
+        printf '%s\n' "$now" > "$NO_STREAM_TS_FILE" || return 1
+        return 1
+    fi
+
+    if (( now - first >= GRACE_PERIOD_SEC )); then
+        touch "$NEED_RESYNC_FLAG" || return 1
+        return 0
+    fi
+
+    return 1
+}
+
+ACTION=${1:-}
+INTERVAL=${OCF_RESKEY_CRM_meta_interval:-0}
+
+case "$ACTION" in
+    validate-all)
+        # sudo заменен на runuser в списке обязательных системных утилит
+        for tool in \
+            bash logger stat find hostname realpath \
+            runuser timeout install flock \
+            tar sha256sum sync du df tail tr awk \
+            mktemp chmod chown grep sed mv rm rmdir touch date
+        do
+            command -v "$tool" >/dev/null 2>&1 || {
+                ocf_log err "Не найдена необходимая команда: $tool"
+                exit "$OCF_ERR_INSTALLED"
+            }
+        done
+
+        for tool in \
+            pg_ctl psql pg_controldata pg_rewind pg_basebackup
+        do
+            if [[ ! -x "$PGBIN/$tool" ]]; then
+                ocf_log err "Не найдена программа: $PGBIN/$tool"
+                exit "$OCF_ERR_INSTALLED"
+            fi
+        done
+
+        exec "$REAL_PAF" "$@"
+        ;;
+
+    start|stop|monitor|promote|demote|notify|reload)
+        # Service files only; never inside PGDATA.
+        install -d -m 0700 -o root -g root "$STATE_DIR" || {
+            ocf_log err \
+                "Не удалось подготовить STATE_DIR: $STATE_DIR"
+            exit "$OCF_ERR_GENERIC"
+        }
+
+        # Pacemaker normally serializes local actions.
+        # Also protect against manual wrapper invocations.
+        exec 9> "$STATE_DIR/agent.lock" ||
+            exit "$OCF_ERR_GENERIC"
+
+        flock -w 1 9 || {
+            ocf_log err \
+                'Другая операция pgsqlms-ha уже выполняется'
+            exit "$OCF_ERR_GENERIC"
+        }
+        ;;
+
+    *)
+        exec "$REAL_PAF" "$@"
+        ;;
+esac
+
+case "$ACTION" in
+    promote)
+        # Базовый агент PAF выполняет продвижение узла в Primary
+        "$REAL_PAF" "$@" 9>&-
+        rc=$?
+
+        # Слоты создаются однократно сразу после успешного перехода в роль мастера
+        if [[ $rc == "$OCF_SUCCESS" ]]; then
+            ensure_slots_on_master ||
+                ocf_log warn \
+                    'Не удалось проверить или создать физические слоты репликации при promote'
+        fi
+
+        exit "$rc"
+        ;;
+
+    monitor)
+        if [[ ! $INTERVAL =~ ^[0-9]+$ ]]; then
+            ocf_log err \
+                "Некорректный CRM_meta_interval: $INTERVAL"
+            exit "$OCF_ERR_CONFIGURED"
+        fi
+
+        # Initial probe: do not repair or otherwise change PGDATA.
+        if [[ $INTERVAL =~ ^0+$ ]]; then
+            local_instance_state
+            rc=$?
+
+            case "$rc" in
+                "$OCF_NOT_RUNNING")
+                    ocf_log info \
+                        'Probe: PostgreSQL остановлен; подготовка данных отложена до start'
+                    exit "$OCF_NOT_RUNNING"
+                    ;;
+                "$OCF_SUCCESS")
+                    # A process exists. Let PAF determine role/health.
+                    "$REAL_PAF" "$@" 9>&-
+                    exit $?
+                    ;;
+                *)
+                    exit "$OCF_ERR_GENERIC"
+                    ;;
+            esac
+        fi
+
+        # Recurring monitor: опрос состояния через PAF
+        "$REAL_PAF" "$@" 9>&-
+        rc=$?
+
+        # Для OCF_RUNNING_MASTER проверка слотов убрана из частого цикла,
+        # чтобы исключить лишние подключения к базе каждые 6 секунд.
+        if [[ $rc == "$OCF_SUCCESS" ]]; then
+            # Needed for logging streaming confirmation.
+            install -d -m 0700 -o root -g root "$RESCUE_DIR" || {
+                ocf_log err \
+                    "Не удалось подготовить RESCUE_DIR: $RESCUE_DIR"
+                exit "$OCF_ERR_GENERIC"
+            }
+
+            if check_divergence_running; then
+                ocf_log err \
+                    'Streaming отсутствует дольше grace period при доступном primary; требуется восстановление'
+                exit "$OCF_ERR_GENERIC"
+            fi
+        fi
+
+        exit "$rc"
+        ;;
+
+    start)
+        # Do NOT use PAF monitor as the gate to recovery.
+        local_instance_state
+        rc=$?
+
+        case "$rc" in
+            "$OCF_SUCCESS")
+                # OCF start must be idempotent.
+                # Never rebuild a running instance.
+                "$REAL_PAF" "$@" 9>&-
+                exit $?
+                ;;
+            "$OCF_NOT_RUNNING")
+                ;;
+            *)
+                ocf_log err \
+                    'Start запрещён: остановка локального PostgreSQL не подтверждена'
+                exit "$OCF_ERR_GENERIC"
+                ;;
+        esac
+
+        if select_primary; then
+            install -d -m 0700 -o root -g root "$RESCUE_DIR" || {
+                ocf_log err \
+                    "Не удалось подготовить RESCUE_DIR: $RESCUE_DIR"
+                exit "$OCF_ERR_GENERIC"
+            }
+
+            # Conservative policy:
+            # every stopped instance joining an available primary
+            # is archived and reconciled before startup.
+            ocf_log info \
+                "Start: найден primary $ACTIVE_PEER_IP; выполняются сохранение ветки и согласование данных"
+
+            if ! perform_resync; then
+                ocf_log err \
+                    'Восстановление завершилось ошибкой; запуск запрещён, сохранённые данные не удалены'
+                exit "$OCF_ERR_GENERIC"
+            fi
+        else
+            if [[ -f $NEED_RESYNC_FLAG ]]; then
+                ocf_log err \
+                    'Требуется восстановление, но доступный primary-источник не найден'
+                exit "$OCF_ERR_GENERIC"
+            fi
+
+            # Could be a cold start of the entire cluster.
+            # Do not invent a source or overwrite local data.
+            if [[ ! -f $PGDATA/PG_VERSION ||
+                  ! -f $PGDATA/global/pg_control ]]; then
+                ocf_log err \
+                    'Primary недоступен, а локальный PGDATA неполон; запуск запрещён'
+                exit "$OCF_ERR_GENERIC"
+            fi
+
+            ocf_log info \
+                'Primary-источник не найден; локальный запуск передаётся PAF без изменения данных'
+        fi
+
+        "$REAL_PAF" "$@" 9>&-
+        exit $?
+        ;;
+
+    stop)
+        "$REAL_PAF" "$@" 9>&-
+        rc=$?
+
+        if [[ $rc == "$OCF_SUCCESS" ]]; then
+            rm -f "$NO_STREAM_TS_FILE" ||
+                ocf_log warn \
+                    'Не удалось удалить таймер отсутствия streaming'
+        fi
+
+        # NEED_RESYNC_FLAG deliberately survives stop.
+        exit "$rc"
+        ;;
+
+    *)
+        # Original PAF handles demote/notify/reload.
+        "$REAL_PAF" "$@" 9>&-
+        exit $?
+        ;;
+esac

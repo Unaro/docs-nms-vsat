@@ -1,0 +1,50 @@
+flowchart TD
+    Start(["Старт: cluster-degraded-unblock.sh"]) --> TrapInit["Установка перехвата сигналов SIGTERM, SIGINT\n(корректный выход)"]
+    TrapInit --> LoadConfigs["Загрузка /etc/default/ha-cluster\nи $BOOT_MODE_FILE (если существует)"]
+    LoadConfigs --> CheckQuorateFast{"Кворум уже есть?\n(corosync-quorumtool -s)"}
+
+    CheckQuorateFast -->|Да| ExitAlreadyQuorate(["Оба узла в сети.\nВыход exit 0"])
+    CheckQuorateFast -->|Нет| DetectRoleTopology{"Определение топологии\nпо hostname -s"}
+
+    %% Определение узла и расчет таймаута
+    DetectRoleTopology -->|NODE1_NAME| SetupNode1["MY_NODE = NODE1\nPEER = NODE2_RING IPs\nEXTRA_DELAY = 0"]
+    DetectRoleTopology -->|NODE2_NAME| SetupNode2["MY_NODE = NODE2\nPEER = NODE1_RING IPs\nEXTRA_DELAY = NODE2_ASYMMETRIC_DELAY_SEC (120s)"]
+    DetectRoleTopology -->|Иначе| ErrUnknownNode["Ошибка: неизвестный узел\nexit 1"]
+
+    SetupNode1 --> CalcTimeout["TOTAL_WAIT = UNBLOCK_TIMEOUT_SEC + EXTRA_DELAY"]
+    SetupNode2 --> CalcTimeout
+
+    %% Цикл ожидания кворума
+    subgraph SubQuorumWait ["Динамическое ожидание соседа"]
+        CalcTimeout --> WaitQuorumLoop{"Ожидание сбора кворума\n(опрос каждые 2 сек до TOTAL_WAIT)"}
+        WaitQuorumLoop -->|Кворум появился| ExitQuorumRestored(["Сосед подключился штатно.\nВыход exit 0"])
+    end
+
+    %% Проверка периметра (Защита от Split-Brain)
+    subgraph SubPerimeterChecks ["Проверка периметра и защита от Split-Brain"]
+        WaitQuorumLoop -->|Таймаут истек| PingGateway{"Маршрутизатор ($ROUTER_IPS)\nотвечает на ping или arping?"}
+        PingGateway -->|Нет| ErrGateway["Ошибка: изоляция от шлюза сети!\nРазблокировка отменена\nexit 1"]
+        PingGateway -->|Да| PingPeerRings{"Сосед отвечает по ICMP\nна Ring 0 или Ring 1?"}
+        PingPeerRings -->|Да| ErrPeerAlive["Ошибка: сосед жив, но потерян кворум!\nРиск Split-Brain\nexit 1"]
+        PingPeerRings -->|Нет| PingVIP{"CLUSTER_VIP отвечает на ping?"}
+        PingVIP -->|Да| ErrVIPAlive["Критическая ошибка: VIP уже занят!\nРиск Split-Brain\nexit 1"]
+    end
+
+    %% Разблокировка в зависимости от роли
+    subgraph SubUnblockLogic ["Разблокировка кворума (wait_for_all)"]
+        PingVIP -->|Нет| CheckLastRole{"LAST_ROLE узла"}
+        CheckLastRole -->|MASTER| DoUnblock["unblock_quorum_safely()"]
+        CheckLastRole -->|SLAVE| WaitSlaveDelay{"Дополнительное ожидание мастера\n(NODE2_ASYMMETRIC_DELAY_SEC = 120s)"}
+        WaitSlaveDelay -->|Мастер ожил| ExitMasterBack(["Мастер появился в сети.\nВыход exit 0"])
+        WaitSlaveDelay -->|Мастер не появился| DoUnblock
+        CheckLastRole -->|Иначе / UNKNOWN| ErrRoleUnknown["Ошибка: роль не MASTER/SLAVE\nАвторазблокировка запрещена\nexit 1"]
+
+        DoUnblock --> ExecUnblock{"Попытка сброса wait_for_all:\n1. corosync-quorumtool -u\n2. corosync-cmapctl cancel_wait_for_all"}
+        ExecUnblock -->|Не удалось| ErrUnblockFail["Критическая ошибка отмены флага\nreturn 1 / exit"]
+        ExecUnblock -->|Успешно| CheckFinalQuorate{"sleep 1;\nКворум активирован?"}
+        CheckFinalQuorate -->|Да| LogSuccess["Кворум успешно форсирован на узле"]
+        CheckFinalQuorate -->|Нет| LogWarn["Предупреждение: wait_for_all снят,\nно кворум не подтвержден"]
+    end
+
+    LogSuccess --> ExitDone(["Завершение работы"])
+    LogWarn --> ExitDone
