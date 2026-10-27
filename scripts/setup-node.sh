@@ -112,7 +112,7 @@ chmod 0600 "$PGPASS_FILE"
 
 echo "hacluster:${HACLUSTER_PASS}" | chpasswd 2>/dev/null || true
 
-# 5. Скрипт проверки роли для балансировщика (с вычитыванием stdin и чистым ответом)
+# 5. Скрипт проверки роли для балансировщика
 install_artifact bin/db-role-check.sh /usr/local/bin/db-role-check.sh 0755
 chmod +x /usr/local/bin/db-role-check.sh
 

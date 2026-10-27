@@ -12,14 +12,14 @@ log_msg() { timeout 2 logger -t cluster-watchdog "$1" || true; }
 trap 'log_msg "Служба остановлена извне. Прерывание ожидания."; exit 0' SIGTERM SIGINT
 
 is_cluster_quorate() {
-  # Проверка наличия кворума (оба узла в сети)
+  # Проверка наличия кворума 
   corosync-quorumtool -s 2>/dev/null | grep -q "Quorate:.*Yes"
 }
 
 unblock_quorum_safely() {
   log_msg "Выполняю отмену wait_for_all для кворума..."
 
-  # 1. Штатный метод через corosync-quorumtool (-u / --unblock)
+  # 1. Штатный метод через corosync-quorumtool
   if corosync-quorumtool -u >/dev/null 2>&1; then
     log_msg "Флаг wait_for_all успешно сброшен через corosync-quorumtool."
   # 2. Резервный метод через прямую запись в cmap Corosync

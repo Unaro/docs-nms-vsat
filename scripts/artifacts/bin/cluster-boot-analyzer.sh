@@ -40,24 +40,21 @@ fi
 was_crashed=0
 
 # 3. Приведение к консистентному состоянию (Crash Recovery)
-# Вмешательство допустимо ТОЛЬКО если локальный процесс PostgreSQL гарантированно не запущен
+# Вмешательство допустимо только если локальный процесс PostgreSQL гарантированно не запущен
 if ! sudo -u postgres "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; then
     if [[ "$state" == "in production" || "$state" == "in archive recovery" ]]; then
         was_crashed=1
         logger -t cluster-precheck -- "Обнаружен 'грязный' статус ($state) при остановленном процессе. Запуск Crash Recovery..."
 
-        # Запуск в изолированном режиме (без сетевого сокета, чтобы внешние клиенты и HAProxy не подключились)
         if sudo -u postgres "$PGBIN/pg_ctl" -D "$PGDATA" \
             -o "-c listen_addresses='' -p $DB_PORT" \
             -w -t "${CRASH_TIMEOUT_SEC:-900}" start; then
 
-            # Штатная остановка (-m fast) для записи чистой контрольной точки в pg_control
             sudo -u postgres "$PGBIN/pg_ctl" -D "$PGDATA" -m fast -w -t 60 stop || {
                 logger -t cluster-precheck -- "[ОШИБКА] Не удалось корректно остановить базу после Crash Recovery" >&2
                 exit 1
             }
 
-            # Повторное чтение обновленного статуса
             state=$(sudo -u postgres "$PGBIN/pg_controldata" "$PGDATA" 2>/dev/null | \
                 awk -F: '/Database cluster state/ {sub(/^[ \t]+/, "", $2); print $2}')
             logger -t cluster-precheck -- "Восстановление завершено. Новый статус: $state"
@@ -99,7 +96,7 @@ fi
 
 [[ $delay =~ ^[1-9][0-9]*$ && $BOOT_MODE_FILE == /* ]] || exit 1
 
-# 6. Фиксация режима в файл для my-app.py
+# 6. Фиксация режима в файл
 umask 077
 mkdir -p "$(dirname "$BOOT_MODE_FILE")"
 temp=$(mktemp "${BOOT_MODE_FILE}.XXXXXX")
