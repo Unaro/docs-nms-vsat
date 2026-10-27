@@ -36,7 +36,7 @@ export const AuthForm: React.FC<AuthFormProps> = ({ isSubmitting = false, isRegi
           required
           />
 
-        <Button type="submit" disabled={isSubmitting} size={'lg'} className={'mt-4 w-full'} variant={'submit'}>
+        <Button type="submit" disabled={isSubmitting} size={'lg'} className={'mt-4 w-full'}>
           {isSubmitting ? buttonText[0] : buttonText[1]}
         </Button>
       </Field>

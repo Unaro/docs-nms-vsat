@@ -4,9 +4,8 @@ declare global {
   var __db: postgres.Sql | undefined;
 }
 
-const connectionString =
-  process.env.DATABASE_URL ||
-  "postgresql://app_user:AppSecretPass!@192.168.122.100:5432/postgres";
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) throw new Error("DATABASE_URL is required");
 
 export const db =
   global.__db ??

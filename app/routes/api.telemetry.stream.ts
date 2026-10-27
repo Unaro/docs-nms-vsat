@@ -1,91 +1,45 @@
 import type { Route } from "./+types/api.telemetry.stream";
 import { db } from "~/lib/db.server";
-
+import { requireUser } from "~/lib/auth.server";
 export async function loader({ request }: Route.LoaderArgs) {
-  let isClosed = false;
-  let heartbeatTimer: NodeJS.Timeout | null = null;
-  let unlistenTelemetry: (() => Promise<void>) | null = null;
-  let unlistenDiscovery: (() => Promise<void>) | null = null;
-
+  await requireUser(request);
+  let closed = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const subscriptions: Array<() => Promise<void>> = [];
+  let controller: ReadableStreamDefaultController<Uint8Array>;
   const cleanup = async () => {
-    if (isClosed) return;
-    isClosed = true;
-
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
-    }
-
-    if (unlistenTelemetry) await unlistenTelemetry().catch(() => {});
-    if (unlistenDiscovery) await unlistenDiscovery().catch(() => {});
+    if (closed) return;
+    closed = true;
+    clearInterval(timer);
+    request.signal.removeEventListener('abort', abort);
+    await Promise.allSettled(subscriptions.map(unlisten => unlisten()));
+    try { controller.close(); } catch { /* Stream was cancelled. */ }
   };
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      const encoder = new TextEncoder();
-
-      const sendEvent = (event: string, data: any) => {
-        if (isClosed) return;
-        try {
-          const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-          controller.enqueue(encoder.encode(payload));
-        } catch {
-          cleanup();
-        }
+  const abort = () => { void cleanup(); };
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(output) {
+      controller = output;
+      request.signal.addEventListener('abort', abort, { once: true });
+      if (request.signal.aborted) { await cleanup(); return; }
+      const send = (event: string, value: unknown) => {
+        if (closed) return;
+        try { output.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`)); }
+        catch { void cleanup(); }
       };
-
-      sendEvent("connected", { time: new Date().toISOString() });
-
       try {
-        // 1. Канал телеметрии узлов
-        const sub1 = await db.listen("node_telemetry_update", (rawPayload) => {
-          try {
-            sendEvent("node_update", JSON.parse(rawPayload));
-          } catch (e) {
-            console.error("Failed to parse telemetry notify:", e);
-          }
-        });
-        unlistenTelemetry = sub1.unlisten;
-
-        // 2. Канал событий автообнаружения
-        const sub2 = await db.listen("discovery_update", (rawPayload) => {
-          try {
-            sendEvent("discovery_update", JSON.parse(rawPayload));
-          } catch (e) {
-            console.error("Failed to parse discovery notify:", e);
-          }
-        });
-        unlistenDiscovery = sub2.unlisten;
-      } catch (err) {
-        console.error("Failed to register postgres listeners:", err);
-        await cleanup();
-        return;
-      }
-
-      // Heartbeat каждые 15 сек
-      heartbeatTimer = setInterval(() => {
-        if (isClosed) return;
-        try {
-          controller.enqueue(encoder.encode(": ping\n\n"));
-        } catch {
-          cleanup();
+        for (const [channel, event] of [['node_telemetry_update', 'node_update'], ['discovery_update', 'discovery_update']] as const) {
+          const subscription = await db.listen(channel, raw => {
+            try { send(event, JSON.parse(raw)); } catch { console.error('Invalid monitoring notification'); }
+          });
+          if (closed) { await subscription.unlisten(); return; }
+          subscriptions.push(subscription.unlisten);
         }
-      }, 15000);
-
-      request.signal.addEventListener("abort", () => cleanup());
+        send('connected', { time: new Date().toISOString() });
+        timer = setInterval(() => { if (!closed) { try { output.enqueue(encoder.encode(': ping\n\n')); } catch { void cleanup(); } } }, 15000);
+      } catch { await cleanup(); }
     },
-
-    async cancel() {
-      await cleanup();
-    },
+    cancel: cleanup,
   });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-transform",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no",
-    },
-  });
+  return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no' } });
 }

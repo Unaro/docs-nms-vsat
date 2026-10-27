@@ -20,9 +20,14 @@ export class HttpNmsApi implements AuthApiPort {
     private baseUrl: string;
     private storage: Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
-    constructor({ baseUrl, storage = localStorage }: HttpApiOptions) {
+    constructor({ baseUrl, storage }: HttpApiOptions) {
         this.baseUrl = baseUrl.replace(/\/$/, "");
-        this.storage = storage;
+        const memory = new Map<string, string>();
+        this.storage = storage ?? (typeof window !== "undefined" ? window.localStorage : {
+            getItem: (key: string) => memory.get(key) ?? null,
+            setItem: (key: string, value: string) => { memory.set(key, value); },
+            removeItem: (key: string) => { memory.delete(key); },
+        });
     }
 
     private get token(): string | null {

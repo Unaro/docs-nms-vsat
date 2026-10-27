@@ -2,6 +2,8 @@ import { useState } from "react";
 import { data, Link, useFetcher, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
 import type { Route } from "./+types/dashboard.credentials";
 import { db } from "~/lib/db.server";
+import { requireUser } from "~/lib/auth.server";
+import { mutationError } from "~/lib/monitoring/validation.server";
 import {
   createCredentialProfile,
   updateCredentialProfile,
@@ -37,13 +39,14 @@ import {
   TableRow,
 } from "~/components/ui/table";
 
-export async function loader({}: LoaderFunctionArgs) {
+export async function loader({ request }: LoaderFunctionArgs) {
+  await requireUser(request, ['admin']);
   const credentials = (await db`
     SELECT 
       c.id,
       c.name,
       c.protocol,
-      c.params,
+      '{}'::jsonb AS params,
       c.created_at,
       COUNT(n.id)::int AS nodes_count
     FROM credential_profiles c
@@ -62,6 +65,7 @@ export async function loader({}: LoaderFunctionArgs) {
 }
 
 export async function action({ request }: ActionFunctionArgs) {
+  await requireUser(request, ['admin']);
   const formData = await request.formData();
   const intent = formData.get("intent");
 
@@ -77,7 +81,7 @@ export async function action({ request }: ActionFunctionArgs) {
     let params: Record<string, any> = {};
     if (protocol === "snmp_v2c") {
       params = {
-        community: String(formData.get("v2c_community") || "public").trim(),
+        community: String(formData.get("v2c_community") || "").trim(),
       };
     } else if (protocol === "snmp_v3") {
       params = {
@@ -97,7 +101,7 @@ export async function action({ request }: ActionFunctionArgs) {
       }
       return data({ success: true });
     } catch (err: any) {
-      return data({ error: err.message || "Ошибка сохранения профиля" }, { status: 500 });
+      return mutationError(err);
     }
   }
 
@@ -107,7 +111,7 @@ export async function action({ request }: ActionFunctionArgs) {
       await deleteCredentialProfile(db, id);
       return data({ success: true });
     } catch (err: any) {
-      return data({ error: err.message || "Ошибка при удалении" }, { status: 400 });
+      return mutationError(err);
     }
   }
 
@@ -155,7 +159,7 @@ export default function CredentialsRoute({ loaderData }: Route.ComponentProps) {
           </div>
           <h1 className="text-2xl font-bold tracking-tight">Профили авторизации</h1>
           <p className="text-sm text-muted-foreground">
-            Учетные записи SNMPv2c Communities и ключи SNMPv3 для доступа к устройствам
+            Профили SNMPv2c для доступа к устройствам
           </p>
         </div>
 
@@ -205,7 +209,7 @@ export default function CredentialsRoute({ loaderData }: Route.ComponentProps) {
                   </TableCell>
                   <TableCell className="font-mono text-xs text-muted-foreground">
                     {cred.protocol === "snmp_v2c" ? (
-                      <span>Community: <strong className="text-foreground">{cred.params?.community}</strong></span>
+                      <span>Секрет сохранен</span>
                     ) : cred.protocol === "snmp_v3" ? (
                       <span>
                         User: <strong className="text-foreground">{cred.params?.username}</strong> | {cred.params?.auth_protocol}+{cred.params?.priv_protocol}
@@ -298,7 +302,7 @@ export default function CredentialsRoute({ loaderData }: Route.ComponentProps) {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="snmp_v2c">SNMPv2c (Community)</SelectItem>
-                  <SelectItem value="snmp_v3">SNMPv3 (User / Auth / Priv)</SelectItem>
+
                 </SelectContent>
               </Select>
             </div>
@@ -310,8 +314,10 @@ export default function CredentialsRoute({ loaderData }: Route.ComponentProps) {
                 <Input
                   id="v2c_community"
                   name="v2c_community"
-                  defaultValue={editingItem?.params?.community || "public"}
-                  required
+                  type="password"
+                  defaultValue=""
+                  placeholder={editingItem ? 'Оставьте пустым, чтобы сохранить секрет' : 'Community'}
+                  required={!editingItem}
                 />
               </div>
             )}
@@ -324,7 +330,7 @@ export default function CredentialsRoute({ loaderData }: Route.ComponentProps) {
                   <Input
                     id="v3_username"
                     name="v3_username"
-                    defaultValue={editingItem?.params?.username || ""}
+                    defaultValue=""
                     placeholder="snmpadmin"
                     required
                   />
@@ -352,7 +358,7 @@ export default function CredentialsRoute({ loaderData }: Route.ComponentProps) {
                       id="v3_auth_key"
                       name="v3_auth_key"
                       type="password"
-                      defaultValue={editingItem?.params?.auth_key || ""}
+                      defaultValue=""
                       placeholder="AuthSecretKey"
                     />
                   </div>
@@ -380,7 +386,7 @@ export default function CredentialsRoute({ loaderData }: Route.ComponentProps) {
                       id="v3_priv_key"
                       name="v3_priv_key"
                       type="password"
-                      defaultValue={editingItem?.params?.priv_key || ""}
+                      defaultValue=""
                       placeholder="PrivSecretKey"
                     />
                   </div>

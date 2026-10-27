@@ -1,40 +1,34 @@
 import { href, Link, redirect, useNavigation, useSubmit } from "react-router";
 import type { Route } from "./+types/login";
 import { AuthForm } from "~/components/AuthForm";
-import { nmsApi } from "~/api";
+import { authenticate, currentUser, demoAuthEnabled, safeRedirect } from "~/lib/auth.server";
 import { Button } from "~/components/ui/button";
 import {User, UserStar } from 'lucide-react'
 import { Field, FieldContent, FieldError, FieldSeparator, FieldTitle } from "~/components/ui/field";
 
-export async function clientLoader({ request }: Route.ClientLoaderArgs) {
-    try {
-        await nmsApi.currentUser();
-
-        const url = new URL(request.url);
-        const redirectTo = url.searchParams.get("redirectTo");
-        return redirect(redirectTo || href('/profile'));
-    } catch { }
+export async function loader({ request }: Route.LoaderArgs) {
+    if (await currentUser(request)) return redirect(safeRedirect(request));
+    return { demoAuthEnabled };
 }
 
-export async function clientAction({ request }: Route.ClientActionArgs) {
+export async function action({ request }: Route.ActionArgs) {
     const formData = await request.formData();
     const url = new URL(request.url);
     const redirectTo = url.searchParams.get("redirectTo");
 
     try {
         const email = String(formData.get("email") || "").trim();
-        const password = String(formData.get("password") || "").trim();
-
-        await nmsApi.login({ email, password });
-        return redirect(redirectTo || href('/profile'));
+        const password = String(formData.get("password") || "");
+        return await authenticate(request, { email, password });
     } catch (e) {
+        if (e instanceof Response) throw e;
         return {
             errors: e instanceof Error ? e.message : "Непредвиденная ошибка!",
         };
     }
 }
 
-export default function LoginPage({ actionData }: Route.ComponentProps) {
+export default function LoginPage({ actionData, loaderData }: Route.ComponentProps) {
     const navigation = useNavigation();
     const submit = useSubmit();
     
@@ -63,6 +57,7 @@ export default function LoginPage({ actionData }: Route.ComponentProps) {
                 </FieldError>
             )}
 
+            {loaderData.demoAuthEnabled && <>
             <FieldSeparator className="my-3" />
 
             <FieldContent className="flex gap-2">
@@ -89,6 +84,7 @@ export default function LoginPage({ actionData }: Route.ComponentProps) {
                 </Button>
             </FieldContent>
 
+            </>}
             <div className="text-gray-400 text-sm pt-2">
                 <span>Нет аккаунта?</span> <Link to={href('/register')} className={'text-primary'}>Зарегистрироваться</Link>
             </div>

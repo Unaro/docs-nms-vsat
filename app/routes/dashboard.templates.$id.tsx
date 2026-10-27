@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { requireUser } from "~/lib/auth.server";
+import { mutationError } from "~/lib/monitoring/validation.server";
 import { data, Link, redirect, useFetcher, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
 import type { Route } from "./+types/dashboard.templates.$id";
 import { db } from "~/lib/db.server";
@@ -53,7 +55,8 @@ const DEFAULT_NEW_TEMPLATE = {
   ],
 };
 
-export async function loader({ params }: LoaderFunctionArgs) {
+export async function loader({ params, request }: LoaderFunctionArgs) {
+  await requireUser(request);
   const id = params.id;
   if (!id) throw new Response("ID required", { status: 400 });
 
@@ -70,10 +73,11 @@ export async function loader({ params }: LoaderFunctionArgs) {
 }
 
 export async function action({ request, params }: ActionFunctionArgs) {
+  await requireUser(request, ['admin']);
   const isNew = params.id === "new";
   const formData = await request.formData();
 
-  const id = String(formData.get("id") || "").trim();
+  const id = isNew ? String(formData.get("id") || "").trim() : params.id!;
   const name = String(formData.get("name") || "").trim();
   const vendor = String(formData.get("vendor") || "").trim() || null;
   const sys_object_id_pattern = String(formData.get("sys_object_id_pattern") || "").trim() || null;
@@ -113,8 +117,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
     }
     return redirect("/dashboard/templates");
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Ошибка сохранения шаблона";
-    return data({ error: message }, { status: 500 });
+    return mutationError(err);
   }
 }
 
@@ -373,7 +376,7 @@ export default function TemplateEditorRoute({ loaderData }: Route.ComponentProps
                       <SelectContent>
                         <SelectItem value="icmp">ICMP (Ping / RTT)</SelectItem>
                         <SelectItem value="snmp">SNMP (Скалярные OID)</SelectItem>
-                        <SelectItem value="snmp_bulk">SNMP Bulk (Таблицы)</SelectItem>
+
                       </SelectContent>
                     </Select>
                   </div>
@@ -429,7 +432,7 @@ export default function TemplateEditorRoute({ loaderData }: Route.ComponentProps
                 )}
 
                 {/* Если это SNMP: Таблица OID */}
-                {(job.collector === "snmp" || job.collector === "snmp_bulk") && (
+                {job.collector === "snmp" && (
                   <div className="space-y-2 border rounded-md p-3 bg-background">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-semibold uppercase text-muted-foreground">

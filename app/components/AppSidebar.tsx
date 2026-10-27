@@ -22,7 +22,7 @@ export function AppSidebar({tabs, isLogginOut}: {tabs: {label: string, path: str
             <SidebarMenuItem key={tab.path} >
                 <NavLink 
                 to={tab.path} 
-                className={({isActive}) => cn('text-gray-800', isActive && 'text-primary pointer-events-none select-none')} >
+                className={({isActive}) => cn('text-foreground/80 hover:text-foreground', isActive && 'text-primary pointer-events-none select-none')} >
                     {({isPending}) => isPending ? 'Загрузка...' : tab.label }
                 </NavLink>
             </SidebarMenuItem>)}
@@ -32,7 +32,7 @@ export function AppSidebar({tabs, isLogginOut}: {tabs: {label: string, path: str
       <SidebarFooter className="items-center">
         <Form className="w-full px-6" method="post" action={href('/logout')}>
             <input type="hidden" name="intent" value="logout" />
-            <Button type="submit" className='w-full' disabled={isLogginOut} variant={'submit'}>
+            <Button type="submit" className='w-full' disabled={isLogginOut}>
                 {isLogginOut ? "Выход..." : "Выйти"}
             </Button>
         </Form>

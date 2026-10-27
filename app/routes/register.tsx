@@ -1,28 +1,23 @@
 import { href, Link, redirect, useNavigation } from "react-router"
-import type { Route } from "./+types/login"
+import type { Route } from "./+types/register"
 import { AuthForm } from "~/components/AuthForm"
-import { nmsApi } from "~/api";
+import { authenticate, currentUser, safeRedirect } from "~/lib/auth.server";
 import { Field, FieldContent, FieldError, FieldTitle } from "~/components/ui/field";
 
 
-export async function clientLoader({request
-}: Route.ClientLoaderArgs) {
-    try {
-        await nmsApi.currentUser();
-        
-        const url = new URL(request.url);
-        const redirectTo = url.searchParams.get("redirectTo");
-        return redirect(redirectTo || href('/profile'));
-    } catch { }
+export async function loader({ request }: Route.LoaderArgs) {
+    if (await currentUser(request)) return redirect(safeRedirect(request));
+    return null;
 }
 
-export async function clientAction({request}: Route.ClientActionArgs) {
+export async function action({request}: Route.ActionArgs) {
     const user = await request.formData();
     try {
         const email = String(user.get("email") || "").trim();
-        const password = String(user.get("password") || "").trim();
-        await nmsApi.register({ email, password });
+        const password = String(user.get("password") || "");
+        return await authenticate(request, { email, password }, true);
     } catch(e) {
+        if (e instanceof Response) throw e;
         return {
             errors: e instanceof Error ? e.message : 'Непредвиденная ошибка!'
         };

@@ -6,6 +6,7 @@ export default [
   route("register", "routes/register.tsx"),
   route("logout", "routes/logout.tsx"),
   route("api/telemetry/stream", "routes/api.telemetry.stream.ts"),
+  route("api/tasks/:id", "routes/api.tasks.$id.ts"),
   layout("routes/_protected.tsx", [
     route("profile", "routes/profile.tsx"),
     route("dashboard", "routes/dashboard.tsx"),

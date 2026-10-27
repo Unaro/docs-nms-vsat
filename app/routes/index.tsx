@@ -1,18 +1,7 @@
 import { href, redirect } from "react-router";
-import { nmsApi } from "~/api";
-
-export async function clientLoader() {
-    try {
-        const user = await nmsApi.currentUser();
-        if (user) {
-            throw redirect(href('/profile'));
-        }
-    } catch (e) {
-        if (e instanceof Response) throw e;
-    }
-    throw redirect(href('/login'));
+import type { Route } from "./+types/index";
+import { currentUser } from "~/lib/auth.server";
+export async function loader({ request }: Route.LoaderArgs) {
+  return redirect(await currentUser(request) ? href("/profile") : href("/login"));
 }
-
-export default function IndexPage() {
-    return null;
-}
+export default function IndexPage() { return null; }

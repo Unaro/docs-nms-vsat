@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTask } from "~/lib/hooks/use-task";
 import { useFetcher } from "react-router";
 import { Button } from "~/components/ui/button";
 import {
@@ -46,7 +47,8 @@ export function NodeFormDialog({
 }: NodeFormDialogProps) {
   const isEdit = Boolean(initialData?.id);
   const formFetcher = useFetcher<{ error?: string; success?: boolean }>();
-  const probeFetcher = useFetcher<{ success?: boolean; icmp?: any; snmp?: any }>();
+  const probeFetcher = useFetcher<{ taskId?: string; error?: string }>();
+  const probeTask = useTask(probeFetcher.data?.taskId);
 
   const [ip, setIp] = useState("");
   const [port, setPort] = useState("161");
@@ -81,8 +83,8 @@ export function NodeFormDialog({
   };
 
   const isSaving = formFetcher.state !== "idle";
-  const isTesting = probeFetcher.state !== "idle";
-  const probeData = probeFetcher.data;
+  const isTesting = probeFetcher.state !== "idle" || Boolean(probeFetcher.data?.taskId && !['completed', 'failed', 'timeout', 'cancelled'].includes(probeTask?.status ?? 'pending'));
+  const probeData = probeTask?.result as { icmp?: any; snmp?: any } | undefined;
 
   return (
   <Dialog open={open} onOpenChange={onOpenChange}>
@@ -98,6 +100,7 @@ export function NodeFormDialog({
       </DialogHeader>
 
       {/* 2. Прокручиваемое тело */}
+      {(probeFetcher.data?.error || probeTask?.error_message) && <p role="alert" className="px-6 text-destructive">{probeFetcher.data?.error || probeTask?.error_message}</p>}
       <formFetcher.Form id="node-form" method="post" className="flex-1 overflow-y-auto p-6 space-y-4">
         <input type="hidden" name="intent" value={isEdit ? "update_node" : "create_node"} />
         {isEdit && <input type="hidden" name="id" value={initialData?.id} />}

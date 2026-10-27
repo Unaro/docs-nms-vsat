@@ -1,6 +1,8 @@
 import { data, Link, useFetcher, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
 import type { Route } from "./+types/dashboard.templates";
 import { db } from "~/lib/db.server";
+import { requireUser } from "~/lib/auth.server";
+import { mutationError } from "~/lib/monitoring/validation.server";
 import { deleteMetricTemplate } from "~/lib/monitoring/config.server";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/components/ui/card";
 import { Badge } from "~/components/ui/badge";
@@ -14,7 +16,8 @@ import {
   TableRow,
 } from "~/components/ui/table";
 
-export async function loader({}: LoaderFunctionArgs) {
+export async function loader({ request }: LoaderFunctionArgs) {
+  await requireUser(request);
   const templates = (await db`
     SELECT 
       t.id,
@@ -40,6 +43,7 @@ export async function loader({}: LoaderFunctionArgs) {
 }
 
 export async function action({ request }: ActionFunctionArgs) {
+  await requireUser(request, ['admin']);
   const formData = await request.formData();
   const intent = formData.get("intent");
 
@@ -49,8 +53,7 @@ export async function action({ request }: ActionFunctionArgs) {
       await deleteMetricTemplate(db, id);
       return data({ success: true });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Ошибка при удалении шаблона";
-      return data({ error: message }, { status: 400 });
+      return mutationError(err);
     }
   }
 

@@ -1,4 +1,8 @@
 import { useCallback, useState } from "react";
+import { randomUUID } from "node:crypto";
+import { requireUser } from "~/lib/auth.server";
+import { mutationError } from "~/lib/monitoring/validation.server";
+import { DiscoveryDialog } from "~/components/sections/discovery-dialog";
 import { data, Link, useFetcher, useRevalidator, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
 import type { Route } from "./+types/dashboard";
 import { db } from "~/lib/db.server";
@@ -25,8 +29,9 @@ import {
   TableRow,
 } from "~/components/ui/table";
 
-export async function loader({}: LoaderFunctionArgs) {
-  const [nodes, credentials, templates] = await Promise.all([
+export async function loader({ request }: LoaderFunctionArgs) {
+  const user = await requireUser(request);
+  const [nodes, credentials, templates, discoveredNodes] = await Promise.all([
     db`
       SELECT 
         n.id,
@@ -46,7 +51,7 @@ export async function loader({}: LoaderFunctionArgs) {
       ORDER BY n.name ASC
     ` as unknown as (NodeTelemetryItem & { credential_id?: string; template_id?: string; custom_port?: number })[],
 
-    db`SELECT id, name, protocol FROM credential_profiles ORDER BY name ASC` as unknown as Array<{
+    db`SELECT id, name, protocol FROM credential_profiles WHERE protocol = 'snmp_v2c' ORDER BY name ASC` as unknown as Array<{
       id: string;
       name: string;
       protocol: string;
@@ -57,9 +62,12 @@ export async function loader({}: LoaderFunctionArgs) {
       name: string;
       vendor: string | null;
     }>,
+    db`SELECT id, host(ip_address) AS ip_address, hostname, vendor, suggested_template_id, matched_credential_id, discovered_at FROM discovered_nodes WHERE status = 'new' ORDER BY discovered_at DESC` as unknown as import("~/components/sections/discovery-dialog").DiscoveredNodeItem[],
   ]);
 
   return {
+    canManage: user.role !== 'viewer',
+    discoveredNodes,
     initialNodes: nodes,
     credentials,
     templates,
@@ -67,6 +75,8 @@ export async function loader({}: LoaderFunctionArgs) {
 }
 
 export async function action({ request }: ActionFunctionArgs) {
+  await requireUser(request, ['admin', 'operator']);
+  try {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
@@ -76,14 +86,7 @@ export async function action({ request }: ActionFunctionArgs) {
     const port = Number(formData.get("custom_port") || 161);
     const credId = String(formData.get("credential_id") || "");
 
-    let community = "public";
-    if (credId) {
-      const [cred] = await db`SELECT params FROM credential_profiles WHERE id = ${credId}`;
-      if (cred?.params?.community) community = cred.params.community;
-    }
-
-    // Вызов через очередь PostgreSQL
-    const probeResult = await runDryRunProbe(db, ip, port, community);
+    const probeResult = await runDryRunProbe(db, ip, port, credId);
     return data(probeResult);
   }
 
@@ -91,8 +94,7 @@ export async function action({ request }: ActionFunctionArgs) {
   if (intent === "run_discovery") {
     const cidr = String(formData.get("cidr") || "192.168.122.0/24");
     // Вызов через очередь PostgreSQL
-    await spawnSubnetDiscovery(db, cidr);
-    return data({ success: true, message: "Сканирование поставлено в очередь" });
+    return data(await spawnSubnetDiscovery(db, cidr), { status: 202 });
   }
 
   // 2. Создание узла
@@ -108,7 +110,7 @@ export async function action({ request }: ActionFunctionArgs) {
       return data({ error: "Имя и IP-адрес обязательны" }, { status: 400 });
     }
 
-    const generatedId = `${name.toLowerCase().replace(/[^a-z0-9_-]/g, "-")}-${ipAddress.replace(/\./g, "-")}`;
+    const generatedId = randomUUID();
     try {
       await createMonitoredNode(db, {
         id: generatedId,
@@ -120,7 +122,7 @@ export async function action({ request }: ActionFunctionArgs) {
       });
       return data({ success: true });
     } catch (err: any) {
-      return data({ error: err.message || "Ошибка при сохранении" }, { status: 500 });
+      return mutationError(err);
     }
   }
 
@@ -145,7 +147,7 @@ export async function action({ request }: ActionFunctionArgs) {
       });
       return data({ success: true });
     } catch (err: any) {
-      return data({ error: err.message || "Ошибка обновления" }, { status: 500 });
+      return mutationError(err);
     }
   }
 
@@ -156,7 +158,7 @@ export async function action({ request }: ActionFunctionArgs) {
       await deleteMonitoredNode(db, id);
       return data({ success: true });
     } catch (err: any) {
-      return data({ error: err.message || "Ошибка при удалении" }, { status: 500 });
+      return mutationError(err);
     }
   }
 
@@ -171,11 +173,20 @@ export async function action({ request }: ActionFunctionArgs) {
       await approveDiscoveredNode(db, discoveredId, { name, templateId, credentialId });
       return data({ success: true });
     } catch (err: any) {
-      return data({ error: err.message || "Ошибка утверждения узла" }, { status: 500 });
+      return mutationError(err);
     }
   }
 
+  if (intent === 'ignore_discovered_node' || intent === 'delete_discovered_node') {
+    const id = String(formData.get('discovered_id') || '');
+    const rows = intent === 'ignore_discovered_node'
+      ? await db`UPDATE discovered_nodes SET status = 'ignored' WHERE id = ${id} AND status = 'new' RETURNING id`
+      : await db`DELETE FROM discovered_nodes WHERE id = ${id} RETURNING id`;
+    if (!rows.length) return data({ error: 'Запись не найдена' }, { status: 404 });
+    return data({ success: true });
+  }
   return data({ error: "Неизвестное действие" }, { status: 400 });
+  } catch (error) { return mutationError(error); }
 }
 
 export default function DashboardRoute({ loaderData }: Route.ComponentProps) {
@@ -259,7 +270,10 @@ export default function DashboardRoute({ loaderData }: Route.ComponentProps) {
             <Button variant="outline">Авторизация</Button>
           </Link>
 
-          <Button onClick={handleOpenCreate}>+ Добавить устройство</Button>
+          {loaderData.canManage && <>
+            <DiscoveryDialog discoveredNodes={loaderData.discoveredNodes} templates={loaderData.templates} credentials={loaderData.credentials} />
+            <Button onClick={handleOpenCreate}>+ Добавить устройство</Button>
+          </>}
         </div>
       </div>
 
@@ -355,6 +369,7 @@ export default function DashboardRoute({ loaderData }: Route.ComponentProps) {
                     <Button
                       variant="ghost"
                       size="sm"
+                      disabled={!loaderData.canManage}
                       onClick={() => handleOpenEdit(node)}
                     >
                       Изменить
@@ -363,6 +378,7 @@ export default function DashboardRoute({ loaderData }: Route.ComponentProps) {
                       variant="ghost"
                       size="sm"
                       className="text-destructive hover:text-destructive"
+                      disabled={!loaderData.canManage}
                       onClick={() => handleDelete(node.id, node.name)}
                     >
                       Удалить
@@ -375,6 +391,7 @@ export default function DashboardRoute({ loaderData }: Route.ComponentProps) {
         </CardContent>
       </Card>
 
+      {deleteFetcher.data?.error && <p role="alert" className="text-destructive">{deleteFetcher.data.error}</p>}
       {/* Unified Add / Edit Dialog with Dry Run */}
       <NodeFormDialog
         open={formDialogOpen}

@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { useFetcher } from "react-router";
+import { useCallback, useState } from "react";
+import { useTask } from "~/lib/hooks/use-task";
+import { useFetcher, useRevalidator } from "react-router";
 import { Button } from "~/components/ui/button";
 import {
   Dialog,
@@ -32,16 +33,14 @@ interface DiscoveryDialogProps {
 export function DiscoveryDialog({ discoveredNodes, templates, credentials }: DiscoveryDialogProps) {
   const [open, setOpen] = useState(false);
   const [cidr, setCidr] = useState("192.168.122.0/24");
-  const [isScanning, setIsScanning] = useState(false);
-  const scanFetcher = useFetcher();
-  const approveFetcher = useFetcher();
-
-  useEffect(() => {
-    setIsScanning(false);
-  }, [discoveredNodes]);
+  const scanFetcher = useFetcher<{ taskId?: string; error?: string }>();
+  const approveFetcher = useFetcher<{ error?: string }>();
+  const revalidator = useRevalidator();
+  const complete = useCallback(() => { void revalidator.revalidate(); }, [revalidator]);
+  const task = useTask(scanFetcher.data?.taskId, complete);
+  const isScanning = scanFetcher.state !== 'idle' || Boolean(scanFetcher.data?.taskId && !['completed', 'failed', 'timeout', 'cancelled'].includes(task?.status ?? 'pending'));
 
   const handleStartScan = () => {
-    setIsScanning(true);
     const fd = new FormData();
     fd.append("intent", "run_discovery");
     fd.append("cidr", cidr);
@@ -86,6 +85,8 @@ export function DiscoveryDialog({ discoveredNodes, templates, credentials }: Dis
             </Button>
             </div>
 
+            {(scanFetcher.data?.error || approveFetcher.data?.error || task?.error_message) && <p role="alert" className="text-destructive">{scanFetcher.data?.error || approveFetcher.data?.error || task?.error_message}</p>}
+            {task?.status === 'completed' && <p role="status">Сканирование завершено</p>}
             {/* Sandbox List */}
             <div className="border rounded-md mt-4 max-h-[350px] overflow-auto">
             <Table>
@@ -124,6 +125,8 @@ export function DiscoveryDialog({ discoveredNodes, templates, credentials }: Dis
                         >
                             В мониторинг
                         </Button>
+                        <Button variant="ghost" size="sm" disabled={approveFetcher.state !== 'idle'} onClick={() => approveFetcher.submit({ intent: 'ignore_discovered_node', discovered_id: item.id }, { method: 'post' })}>Игнорировать</Button>
+                        <Button variant="ghost" size="sm" disabled={approveFetcher.state !== 'idle'} onClick={() => approveFetcher.submit({ intent: 'delete_discovered_node', discovered_id: item.id }, { method: 'post' })}>Удалить</Button>
                         </TableCell>
                     </TableRow>
                     ))

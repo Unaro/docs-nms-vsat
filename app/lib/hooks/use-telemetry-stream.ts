@@ -19,61 +19,67 @@ export function useTelemetryStream(
   const [isConnected, setIsConnected] = useState<boolean>(false);
 
   useEffect(() => {
-    setNodes((prevNodes) => {
-      const prevMap = new Map(prevNodes.map((n) => [n.id, n]));
-      return initialNodes.map((newNode) => {
-        const prev = prevMap.get(newNode.id);
-        if (!prev) return newNode;
-        return {
-          ...newNode,
-          status: prev.status !== "unknown" ? prev.status : newNode.status,
-          latency_ms: prev.latency_ms ?? newNode.latency_ms,
-          last_polled_by: prev.last_polled_by ?? newNode.last_polled_by,
-          updated_at: prev.updated_at ?? newNode.updated_at,
-        };
-      });
-    });
+    setNodes(prevNodes => initialNodes.map(node => {
+      const previous = prevNodes.find(item => item.id === node.id);
+      return previous && Date.parse(previous.updated_at ?? '') > Date.parse(node.updated_at ?? '') ? { ...node, status: previous.status, latency_ms: previous.latency_ms, last_polled_by: previous.last_polled_by, updated_at: previous.updated_at } : node;
+    }));
   }, [initialNodes]);
 
   useEffect(() => {
-    const eventSource = new EventSource("/api/telemetry/stream");
+    let eventSource: EventSource | null = null;
+    let closed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let retries = 0;
+    let announcedDiscovery = false;
 
-    eventSource.addEventListener("connected", () => {
-      setIsConnected(true);
-    });
+    const connect = () => {
+      if (closed || retries >= 5) return;
+      eventSource = new EventSource("/api/telemetry/stream");
 
-    // Живой статус узлов
-    eventSource.addEventListener("node_update", (event: MessageEvent) => {
-      try {
-        const update = JSON.parse(event.data);
-        setNodes((prevNodes) =>
-          prevNodes.map((node) => {
-            if (node.id !== update.node_id) return node;
-            return {
-              ...node,
-              status: update.status,
-              latency_ms: update.latency_ms,
-              last_polled_by: update.last_polled_by,
-              updated_at: update.updated_at,
-            };
-          })
-        );
-      } catch (err) {
-        console.error("Failed to parse node_update:", err);
-      }
-    });
+      eventSource.addEventListener("connected", () => {
+        retries = 0;
+        setIsConnected(true);
+        if (!announcedDiscovery) { announcedDiscovery = true; onDiscoveryUpdate?.(); }
+      });
 
-    // Сигнал обновления песочницы обнаружения
-    eventSource.addEventListener("discovery_update", () => {
-      onDiscoveryUpdate?.();
-    });
+      // Живой статус узлов
+      eventSource.addEventListener("node_update", (event: MessageEvent) => {
+        try {
+          const update = JSON.parse(event.data);
+          setNodes((prevNodes) =>
+            prevNodes.map((node) => {
+              if (node.id !== update.node_id || Date.parse(update.updated_at) < Date.parse(node.updated_at ?? '')) return node;
+              return {
+                ...node,
+                status: update.status,
+                latency_ms: update.latency_ms,
+                last_polled_by: update.last_polled_by,
+                updated_at: update.updated_at,
+              };
+            })
+          );
+        } catch (err) {
+          console.error("Failed to parse node_update:", err);
+        }
+      });
 
-    eventSource.onerror = () => {
-      setIsConnected(false);
+      // Сигнал обновления песочницы обнаружения
+      eventSource.addEventListener("discovery_update", () => {
+        onDiscoveryUpdate?.();
+      });
+
+      eventSource.onerror = () => {
+        setIsConnected(false);
+        eventSource?.close();
+        eventSource = null;
+        if (!closed && ++retries < 5) retryTimer = setTimeout(connect, Math.min(1000 * 2 ** retries, 15000));
+      };
     };
 
     return () => {
-      eventSource.close();
+      closed = true;
+      clearTimeout(retryTimer);
+      eventSource?.close();
       setIsConnected(false);
     };
   }, [onDiscoveryUpdate]);

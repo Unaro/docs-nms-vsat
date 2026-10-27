@@ -1,6 +1,10 @@
-import { data, Link, useFetcher, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
+import { useCallback } from "react";
+import { useTask } from "~/lib/hooks/use-task";
+import { data, Link, useFetcher, useRevalidator, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
 import type { Route } from "./+types/dashboard.nodes.$id";
 import { db } from "~/lib/db.server";
+import { requireUser } from "~/lib/auth.server";
+import { mutationError } from "~/lib/monitoring/validation.server";
 import { inspectAndSaveNode } from "~/lib/monitoring/nodes.server";
 import { StatusDot, type NodeStatusType } from "~/components/elements/status-dot";
 import { Badge } from "~/components/ui/badge";
@@ -15,7 +19,8 @@ import {
   TableRow,
 } from "~/components/ui/table";
 
-export async function loader({ params }: LoaderFunctionArgs) {
+export async function loader({ params, request }: LoaderFunctionArgs) {
+  await requireUser(request);
   const nodeId = params.id;
   if (!nodeId) throw new Response("Node ID required", { status: 400 });
 
@@ -50,6 +55,7 @@ export async function loader({ params }: LoaderFunctionArgs) {
 }
 
 export async function action({ params, request }: ActionFunctionArgs) {
+  await requireUser(request, ['admin', 'operator']);
   const nodeId = params.id;
   if (!nodeId) return data({ error: "Missing node ID" }, { status: 400 });
 
@@ -58,10 +64,9 @@ export async function action({ params, request }: ActionFunctionArgs) {
 
   if (intent === "inspect_now") {
     try {
-      await inspectAndSaveNode(db, nodeId);
-      return data({ success: true });
+      return data(await inspectAndSaveNode(db, nodeId), { status: 202 });
     } catch (err: any) {
-      return data({ error: err.message || "Сбой опроса параметров" }, { status: 500 });
+      return mutationError(err);
     }
   }
 
@@ -70,8 +75,11 @@ export async function action({ params, request }: ActionFunctionArgs) {
 
 export default function NodeDetailRoute({ loaderData }: Route.ComponentProps) {
   const { node } = loaderData;
-  const fetcher = useFetcher<{ error?: string; success?: boolean }>();
-  const isRefreshing = fetcher.state !== "idle";
+  const fetcher = useFetcher<{ error?: string; taskId?: string }>();
+  const revalidator = useRevalidator();
+  const onComplete = useCallback(() => { void revalidator.revalidate(); }, [revalidator]);
+  const task = useTask(fetcher.data?.taskId, onComplete);
+  const isRefreshing = fetcher.state !== "idle" || Boolean(fetcher.data?.taskId && !['completed', 'failed', 'timeout', 'cancelled'].includes(task?.status ?? 'pending'));
 
   const metrics = node.metrics || {};
   const sys = metrics.system || {};
@@ -115,6 +123,8 @@ export default function NodeDetailRoute({ loaderData }: Route.ComponentProps) {
         </div>
       )}
 
+      {task?.error_message && <p role="alert" className="text-destructive">{task.error_message}</p>}
+      {task?.status === 'completed' && <p role="status">Опрос завершен</p>}
       {/* 2. Top Summary & Hardware Cards */}
       <div className="grid gap-4 md:grid-cols-3">
         {/* Card: Availability */}
